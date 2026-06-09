@@ -1,4 +1,4 @@
-package com.tetramonitor
+package com.anonymous.TetraMonitor
 
 import android.os.Build
 import android.os.Bundle

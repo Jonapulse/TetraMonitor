@@ -377,7 +377,7 @@ export default function App() {
 
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>TETRA<Text style={styles.headerAccent}>MONITOR</Text></Text>
+        <Text style={styles.headerTitle}>TETRASKI</Text>
         <Text style={styles.headerSub}>Radio Controller Interface</Text>
       </View>
 

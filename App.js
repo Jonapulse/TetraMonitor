@@ -28,6 +28,7 @@ function useBLE() {
     radioDetected: false,
     radioConnected: false,
     scanning: false,
+    sensorDropped: false,
     sensorT2: 0,
     sensorT3: 0,
     direction: 0,
@@ -39,6 +40,7 @@ function useBLE() {
   const managerRef   = useRef(null);
   const deviceRef    = useRef(null);
   const scanTimerRef = useRef(null);
+  const lastDataTime = useRef(null);
 
   // Initialise BLE manager once
   useEffect(() => {
@@ -97,6 +99,7 @@ function useBLE() {
           const direction = bytes[0];
           const t2 = (bytes[1] << 8) | bytes[2];
           const t3 = (bytes[3] << 8) | bytes[4];
+          lastDataTime.current = Date.now();
           setState(prev => ({ ...prev, direction, sensorT2: t2, sensorT3: t3 }));
         }
       );
@@ -123,10 +126,12 @@ function useBLE() {
       device.onDisconnected(() => {
         clearInterval(battInterval);
         deviceRef.current = null;
+        lastDataTime.current = null;
         setState(prev => ({
           ...prev,
           radioDetected: false,
           radioConnected: false,
+          sensorDropped: false,
           sensorT2: 0,
           sensorT3: 0,
           direction: 0,
@@ -249,6 +254,21 @@ function useBLE() {
     };
   }, []);
 
+  // Claude: Poll every second while radio is connected. If sensor data has been
+  // silent for >3s, flag sensorDropped. Clears automatically when data resumes.
+  // Pure observer — never sends commands or interferes with firmware reconnect.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setState(prev => {
+        if (!prev.radioConnected || lastDataTime.current === null) return prev;
+        const dropped = Date.now() - lastDataTime.current > 3000;
+        if (dropped === prev.sensorDropped) return prev;
+        return { ...prev, sensorDropped: dropped };
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
   return { state, startScan, disconnect, sendCommand };
 }
 
@@ -321,11 +341,11 @@ function SensorBar({ label, value, max = 1023, threshold, battery }) {
 
 
 // ─── Connection Status Badge ──────────────────────────────────────────────────
-function StatusBadge({ detected, connected, scanning }) {
+function StatusBadge({ detected, connected, scanning, sensorDropped }) {
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
-    if (scanning) {
+    if (scanning || sensorDropped) {
       Animated.loop(
         Animated.sequence([
           Animated.timing(pulseAnim, { toValue: 0.3, duration: 600, useNativeDriver: true }),
@@ -336,15 +356,15 @@ function StatusBadge({ detected, connected, scanning }) {
       pulseAnim.stopAnimation();
       pulseAnim.setValue(1);
     }
-  }, [scanning]);
+  }, [scanning, sensorDropped]);
 
-  const color    = connected ? '#00e5ff' : detected ? '#ffd600' : scanning ? '#888' : '#f44336';
-  const label    = connected ? 'CONNECTED' : detected ? 'DETECTED' : scanning ? 'SCANNING' : 'NOT FOUND';
-  const sublabel = connected ? 'TetraRadio' : detected ? 'Connecting...' : scanning ? 'Looking for TetraRadio' : 'Radio controller offline';
+  const color    = sensorDropped ? '#ff6d00' : connected ? '#00e5ff' : detected ? '#ffd600' : scanning ? '#888' : '#f44336';
+  const label    = sensorDropped ? 'SENSOR DROPPED' : connected ? 'CONNECTED' : detected ? 'DETECTED' : scanning ? 'SCANNING' : 'NOT FOUND';
+  const sublabel = sensorDropped ? 'Reconnecting to sensor...' : connected ? 'TetraRadio' : detected ? 'Connecting...' : scanning ? 'Looking for TetraRadio' : 'Radio controller offline';
 
   return (
     <View style={styles.statusCard}>
-      <Animated.View style={[styles.statusDot, { backgroundColor: color, opacity: scanning ? pulseAnim : 1 }]} />
+      <Animated.View style={[styles.statusDot, { backgroundColor: color, opacity: (scanning || sensorDropped) ? pulseAnim : 1 }]} />
       <View>
         <Text style={[styles.statusLabel, { color }]}>{label}</Text>
         <Text style={styles.statusSub}>{sublabel}</Text>
@@ -358,7 +378,7 @@ function StatusBadge({ detected, connected, scanning }) {
 export default function App() {
   const { state, startScan, disconnect, sendCommand } = useBLE();
   const { radioDetected, radioConnected, scanning, sensorT2, sensorT3,
-          direction, battT2, battT3, log } = state;
+          direction, battT2, battT3, sensorDropped, log } = state;
 
   const [sensitivity, setSensitivity] = useState(0);
   const [showLog, setShowLog] = useState(false);
@@ -384,7 +404,7 @@ export default function App() {
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
 
         {/* Connection Status */}
-        <StatusBadge detected={radioDetected} connected={radioConnected} scanning={scanning} />
+        <StatusBadge detected={radioDetected} connected={radioConnected} scanning={scanning} sensorDropped={sensorDropped} />
 
         {/* Scan / Disconnect Button */}
         <TouchableOpacity

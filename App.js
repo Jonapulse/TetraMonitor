@@ -20,6 +20,7 @@ const SERVICE_UUID      = '12345678-1234-1234-1234-123456789abc';
 const SENSOR_DATA_UUID  = '12345678-1234-1234-1234-123456789abd';
 const BATTERY_DATA_UUID = '12345678-1234-1234-1234-123456789abe';
 const COMMAND_UUID      = '12345678-1234-1234-1234-123456789abf';
+const CONFIG_UUID       = '12345678-1234-1234-1234-123456789ac0';  //Claude: one-shot config packet on connect
 const DEVICE_NAME       = 'TetraRadio';
 
 // ─── Real BLE Hook ────────────────────────────────────────────────────────────
@@ -28,10 +29,13 @@ function useBLE() {
     radioDetected: false,
     radioConnected: false,
     scanning: false,
-    sensorDropped: false,
-    sensorT2: 0,
-    sensorT3: 0,
-    direction: 0,
+    sensorDropped: false,  //Claude: true when sensor data has been silent for >3s
+    sensorMode: 2,
+    sensitivities: [1, 1, 1, 1],
+    invertPair0: false,
+    invertPair1: false,
+    direction0: 0, val0: 0, val1: 0,
+    direction1: 0, val2: 0, val3: 0,
     battT2: 0,
     battT3: 0,
     log: ['Ready. Press SCAN to find TetraRadio.'],
@@ -40,7 +44,7 @@ function useBLE() {
   const managerRef   = useRef(null);
   const deviceRef    = useRef(null);
   const scanTimerRef = useRef(null);
-  const lastDataTime = useRef(null);
+  const lastDataTime = useRef(null);  //Claude: timestamp of last received sensor notification
 
   // Initialise BLE manager once
   useEffect(() => {
@@ -94,13 +98,28 @@ function useBLE() {
           }
           if (!characteristic?.value) return;
 
-          // Decode base64 payload: [direction, t2_high, t2_low, t3_high, t3_low]
+          // Decode base64 payload:
+          // [dir0, val0h, val0l, val1h, val1l, dir1, val2h, val2l, val3h, val3l]
+          // Bytes 5-9 are only valid in 4-sensor mode; in 2-sensor mode firmware
+          // sends 5 bytes so we guard with length checks.
           const bytes = Buffer.from(characteristic.value, 'base64');
-          const direction = bytes[0];
-          const t2 = (bytes[1] << 8) | bytes[2];
-          const t3 = (bytes[3] << 8) | bytes[4];
+          console.log('payload length:', bytes.length, Array.from(bytes));
+          const direction0 = bytes[0];
+          const val0 = (bytes[1] << 8) | bytes[2];
+          const val1 = (bytes[3] << 8) | bytes[4];
+          const direction1 = bytes.length >= 10 ? bytes[5] : 0;
+          const val2 = bytes.length >= 10 ? (bytes[6] << 8) | bytes[7] : 0;
+          const val3 = bytes.length >= 10 ? (bytes[8] << 8) | bytes[9] : 0;
+
+//          if(bytes.length >= 10){
+//            console.log('Vals :', val2, val3);
+//          }
           lastDataTime.current = Date.now();
-          setState(prev => ({ ...prev, direction, sensorT2: t2, sensorT3: t3 }));
+          setState(prev => ({
+            ...prev,
+            direction0, val0, val1,
+            direction1, val2, val3,
+          }));
         }
       );
 
@@ -126,15 +145,14 @@ function useBLE() {
       device.onDisconnected(() => {
         clearInterval(battInterval);
         deviceRef.current = null;
-        lastDataTime.current = null;
+        lastDataTime.current = null;  //Claude: clear so drop detector doesn't fire after disconnect
         setState(prev => ({
           ...prev,
           radioDetected: false,
           radioConnected: false,
           sensorDropped: false,
-          sensorT2: 0,
-          sensorT3: 0,
-          direction: 0,
+          direction0: 0, val0: 0, val1: 0,
+          direction1: 0, val2: 0, val3: 0,
           battT2: 0,
           battT3: 0,
         }));
@@ -142,6 +160,25 @@ function useBLE() {
       });
 
       addLog('Subscribed to sensor data');
+
+      // Claude: Monitor config characteristic — firmware sends one packet on phone connect
+      // with current settings so app display matches firmware state.
+      // Packet: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
+      device.monitorCharacteristicForService(
+        SERVICE_UUID,
+        CONFIG_UUID,
+        (error, characteristic) => {
+          if (error || !characteristic?.value) return;
+          const bytes = Buffer.from(characteristic.value, 'base64');
+          if (bytes.length < 6) return;
+          const sensorMode   = bytes[0] === 4 ? 4 : 2;
+          const invertPair0  = (bytes[1] & 0x01) !== 0;
+          const invertPair1  = (bytes[1] & 0x02) !== 0;
+          const sensitivities = [bytes[2], bytes[3], bytes[4], bytes[5]];
+          setState(prev => ({ ...prev, sensorMode, invertPair0, invertPair1, sensitivities }));
+          addLog(`Config synced: ${sensorMode} sensors, inv=[${invertPair0},${invertPair1}], sens=[${sensitivities}]`);
+        }
+      );
     } catch (e) {
       addLog(`Subscribe error: ${e.message}`);
     }
@@ -221,9 +258,8 @@ function useBLE() {
       radioDetected: false,
       radioConnected: false,
       scanning: false,
-      sensorT2: 0,
-      sensorT3: 0,
-      direction: 0,
+      direction0: 0, val0: 0, val1: 0,
+      direction1: 0, val2: 0, val3: 0,
       battT2: 0,
       battT3: 0,
     }));
@@ -254,6 +290,37 @@ function useBLE() {
     };
   }, []);
 
+  // Claude: sensitivity command chars per sensor: 0='0'/'1'/'2', 1='6'/'7'/'8', 2='i'/'j'/'k', 3='l'/'m'/'n'
+  const SENS_CMDS = [
+    ['0','1','2'],
+    ['6','7','8'],
+    ['i','j','k'],
+    ['l','m','n'],
+  ];
+
+  const handleSensorMode = useCallback((mode) => {
+    setState(prev => ({ ...prev, sensorMode: mode }));
+    sendCommand(mode === 2 ? 'o' : 'p');
+  }, [sendCommand]);
+
+  const handleSensitivity = useCallback((sensorIndex, level) => {
+    setState(prev => {
+      const next = [...prev.sensitivities];
+      next[sensorIndex] = level;
+      return { ...prev, sensitivities: next };
+    });
+    sendCommand(SENS_CMDS[sensorIndex][level]);
+  }, [sendCommand]);
+
+  const handleInvert = useCallback((pair, inverted) => {  //Claude: pair 0 = left/right, pair 1 = wedge
+    setState(prev => pair === 0
+      ? { ...prev, invertPair0: inverted }
+      : { ...prev, invertPair1: inverted }
+    );
+    if (pair === 0) sendCommand(inverted ? '4' : '3');
+    else            sendCommand(inverted ? 'h' : 'g');
+  }, [sendCommand]);
+
   // Claude: Poll every second while radio is connected. If sensor data has been
   // silent for >3s, flag sensorDropped. Clears automatically when data resumes.
   // Pure observer — never sends commands or interferes with firmware reconnect.
@@ -269,54 +336,78 @@ function useBLE() {
     return () => clearInterval(interval);
   }, []);
 
-  return { state, startScan, disconnect, sendCommand };
+  return { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert };
 }
 
 
 // ─── Direction Indicator Component ───────────────────────────────────────────
-function DirectionIndicator({ direction }) {
-  const leftAnim  = useRef(new Animated.Value(0)).current;
-  const rightAnim = useRef(new Animated.Value(0)).current;
+// direction0: 0=idle, 1=left, 2=right
+// direction1: 0=idle, 3=wedge in, 4=wedge out
+function DirectionIndicator({ direction0, direction1, sensorMode }) {
+  const leftAnim    = useRef(new Animated.Value(0)).current;
+  const rightAnim   = useRef(new Animated.Value(0)).current;
+  const wedgeInAnim = useRef(new Animated.Value(0)).current;
+  const wedgeOutAnim= useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
     Animated.parallel([
-      Animated.timing(leftAnim,  { toValue: direction === 1 ? 1 : 0, duration: 80, useNativeDriver: false }),
-      Animated.timing(rightAnim, { toValue: direction === 2 ? 1 : 0, duration: 80, useNativeDriver: false }),
+      Animated.timing(leftAnim,     { toValue: direction0 === 1 ? 1 : 0, duration: 80, useNativeDriver: false }),
+      Animated.timing(rightAnim,    { toValue: direction0 === 2 ? 1 : 0, duration: 80, useNativeDriver: false }),
+      Animated.timing(wedgeInAnim,  { toValue: direction1 === 3 ? 1 : 0, duration: 80, useNativeDriver: false }),
+      Animated.timing(wedgeOutAnim, { toValue: direction1 === 4 ? 1 : 0, duration: 80, useNativeDriver: false }),
     ]).start();
-  }, [direction]);
+  }, [direction0, direction1]);
 
-  const leftBg  = leftAnim.interpolate({ inputRange: [0,1], outputRange: ['#1a2030', '#00e5ff'] });
-  const rightBg = rightAnim.interpolate({ inputRange: [0,1], outputRange: ['#1a2030', '#00e5ff'] });
-  const leftTxt = leftAnim.interpolate({ inputRange: [0,1], outputRange: ['#3a4a60', '#001820'] });
-  const rightTxt = rightAnim.interpolate({ inputRange: [0,1], outputRange: ['#3a4a60', '#001820'] });
+  const mkBg  = (anim) => anim.interpolate({ inputRange: [0,1], outputRange: ['#1a2030', '#00e5ff'] });
+  const mkTxt = (anim) => anim.interpolate({ inputRange: [0,1], outputRange: ['#3a4a60', '#001820'] });
 
   return (
-    <View style={styles.dirRow}>
-      <Animated.View style={[styles.dirArrow, { backgroundColor: leftBg }]}>
-        <Animated.Text style={[styles.dirArrowText, { color: leftTxt }]}>◀</Animated.Text>
-      </Animated.View>
-
-      <View style={styles.dirCenter}>
-        <Text style={[styles.dirLabel, direction === 0 && styles.dirLabelActive]}>
-          {direction === 0 ? 'IDLE' : direction === 1 ? 'LEFT' : 'RIGHT'}
-        </Text>
+    <View style={{ marginBottom: 16 }}>
+      {/* Pair 0: Left / Right */}
+      <View style={styles.dirRow}>
+        <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(leftAnim) }]}>
+          <Animated.Text style={[styles.dirArrowText, { color: mkTxt(leftAnim) }]}>◀</Animated.Text>
+        </Animated.View>
+        <View style={styles.dirCenter}>
+          <Text style={styles.dirPairLabel}>L / R</Text>
+          <Text style={[styles.dirLabel, direction0 === 0 && styles.dirLabelActive]}>
+            {direction0 === 0 ? 'IDLE' : direction0 === 1 ? 'LEFT' : 'RIGHT'}
+          </Text>
+        </View>
+        <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(rightAnim) }]}>
+          <Animated.Text style={[styles.dirArrowText, { color: mkTxt(rightAnim) }]}>▶</Animated.Text>
+        </Animated.View>
       </View>
 
-      <Animated.View style={[styles.dirArrow, { backgroundColor: rightBg }]}>
-        <Animated.Text style={[styles.dirArrowText, { color: rightTxt }]}>▶</Animated.Text>
-      </Animated.View>
+      {/* Pair 1: Wedge In / Wedge Out — only in 4-sensor mode */}
+      {sensorMode === 4 && (
+        <View style={styles.dirRow}>
+          <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(wedgeInAnim) }]}>
+            <Animated.Text style={[styles.dirArrowText, { color: mkTxt(wedgeInAnim) }]}>▲</Animated.Text>
+          </Animated.View>
+          <View style={styles.dirCenter}>
+            <Text style={styles.dirPairLabel}>WEDGE</Text>
+            <Text style={[styles.dirLabel, direction1 === 0 && styles.dirLabelActive]}>
+              {direction1 === 0 ? 'IDLE' : direction1 === 3 ? 'IN' : 'OUT'}
+            </Text>
+          </View>
+          <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(wedgeOutAnim) }]}>
+            <Animated.Text style={[styles.dirArrowText, { color: mkTxt(wedgeOutAnim) }]}>▼</Animated.Text>
+          </Animated.View>
+        </View>
+      )}
     </View>
   );
 }
 
 
-// ─── Sensor Bar Component ─────────────────────────────────────────────────────
-function SensorBar({ label, value, max = 1023, threshold, battery }) {
+// ─── Sensor Card Component ────────────────────────────────────────────────────
+function SensorCard({ label, value, max = 1023, threshold, battery, sensitivityIndex, onSensitivity }) {
   const fillPct = Math.min(value / max, 1);
   const isActive = value > threshold;
 
   return (
-    <View style={styles.sensorBlock}>
+    <View style={styles.sensorCard}>
       <View style={styles.sensorHeader}>
         <Text style={styles.sensorLabel}>{label}</Text>
         <View style={styles.sensorMeta}>
@@ -335,13 +426,66 @@ function SensorBar({ label, value, max = 1023, threshold, battery }) {
         )}
       </View>
       <Text style={styles.sensorValue}>{value}</Text>
+      <View style={styles.sensRow}>
+        {['L','M','H'].map((lbl, i) => (
+          <TouchableOpacity
+            key={i}
+            style={[styles.sensBtn, sensitivityIndex === i && styles.sensBtnActive]}
+            onPress={() => onSensitivity(i)}
+          >
+            <Text style={[styles.sensBtnText, sensitivityIndex === i && styles.sensBtnTextActive]}>{lbl}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+
+// ─── Sensor Pair Block ────────────────────────────────────────────────────────
+function SensorPairBlock({ pairLabel, labelA, labelB, valA, valB, battA, battB,
+                           threshold, sensitivityA, sensitivityB, inverted,
+                           onSensitivityA, onSensitivityB, onInvert }) {
+  return (
+    <View style={styles.pairBlock}>
+      <View style={styles.pairHeader}>
+        <Text style={styles.pairLabel}>{pairLabel}</Text>
+        <View style={styles.invertRow}>
+          {['NORMAL','INVERT'].map((lbl, i) => {
+            const active = i === 0 ? !inverted : inverted;
+            return (
+              <TouchableOpacity
+                key={lbl}
+                style={[styles.segBtn, active && styles.segBtnActive, { flex: 0, paddingHorizontal: 12 }]}
+                onPress={() => onInvert(i === 1)}
+              >
+                <Text style={[styles.segBtnText, active && styles.segBtnTextActive]}>{lbl}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      </View>
+      <View style={styles.cardRow}>
+        <View style={{ flex: 1 }}>
+          <SensorCard
+            label={labelA} value={valA} threshold={threshold}
+            battery={battA} sensitivityIndex={sensitivityA} onSensitivity={onSensitivityA}
+          />
+        </View>
+        <View style={{ flex: 1 }}>
+          <SensorCard
+            label={labelB} value={valB} threshold={threshold}
+            battery={battB} sensitivityIndex={sensitivityB} onSensitivity={onSensitivityB}
+          />
+        </View>
+      </View>
     </View>
   );
 }
 
 
 // ─── Connection Status Badge ──────────────────────────────────────────────────
-function StatusBadge({ detected, connected, scanning, sensorDropped }) {
+function StatusBadge({ detected, connected, scanning, sensorDropped }) {  //Claude: added sensorDropped
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
@@ -358,6 +502,7 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {
     }
   }, [scanning, sensorDropped]);
 
+  //Claude: sensorDropped takes priority over connected — it is a sub-state of connected
   const color    = sensorDropped ? '#ff6d00' : connected ? '#00e5ff' : detected ? '#ffd600' : scanning ? '#888' : '#f44336';
   const label    = sensorDropped ? 'SENSOR DROPPED' : connected ? 'CONNECTED' : detected ? 'DETECTED' : scanning ? 'SCANNING' : 'NOT FOUND';
   const sublabel = sensorDropped ? 'Reconnecting to sensor...' : connected ? 'TetraRadio' : detected ? 'Connecting...' : scanning ? 'Looking for TetraRadio' : 'Radio controller offline';
@@ -376,20 +521,13 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const { state, startScan, disconnect, sendCommand } = useBLE();
-  const { radioDetected, radioConnected, scanning, sensorT2, sensorT3,
-          direction, battT2, battT3, sensorDropped, log } = state;
+  const { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert } = useBLE();
+  const { radioDetected, radioConnected, scanning, sensorDropped,
+          sensorMode, sensitivities, invertPair0, invertPair1,
+          direction0, val0, val1, direction1, val2, val3,
+          battT2, battT3, log } = state;
 
-  const [sensitivity, setSensitivity] = useState(0);
   const [showLog, setShowLog] = useState(false);
-
-  const handleSensitivity = (level) => {
-    setSensitivity(level);
-    sendCommand(String(level));
-  };
-
-  const t2Threshold = 512;
-  const t3Threshold = 512;
 
   return (
     <View style={styles.root}>
@@ -418,40 +556,54 @@ export default function App() {
         </TouchableOpacity>
 
         {/* Direction Indicator */}
-        {radioConnected && (
+          {radioConnected && (
           <>
             <Text style={styles.sectionTitle}>DIRECTION OUTPUT</Text>
-            <DirectionIndicator direction={direction} />
+            <DirectionIndicator direction0={direction0} direction1={direction1} sensorMode={sensorMode} />
 
-            {/* Sensor Bars */}
+            {/* Sensor Pair Blocks */}
             <Text style={styles.sectionTitle}>SENSOR DATA</Text>
-            <SensorBar label="T2" value={sensorT2} threshold={t2Threshold} battery={battT2} />
-            <SensorBar label="T3" value={sensorT3} threshold={t3Threshold} battery={battT3} />
+
+            <SensorPairBlock
+              pairLabel="LEFT / RIGHT"
+              labelA="Left"   valA={val0} battA={battT2}
+              labelB="Right"  valB={val1} battB={battT3}
+              threshold={512}
+              sensitivityA={sensitivities[0]} onSensitivityA={(lvl) => handleSensitivity(0, lvl)}
+              sensitivityB={sensitivities[1]} onSensitivityB={(lvl) => handleSensitivity(1, lvl)}
+              inverted={invertPair0}
+              onInvert={(inv) => handleInvert(0, inv)}
+            />
+
+            {sensorMode === 4 && (
+              <SensorPairBlock
+                pairLabel="WEDGE IN / WEDGE OUT"
+                labelA="Wedge In"  valA={val2} battA={0}
+                labelB="Wedge Out" valB={val3} battB={0}
+                threshold={512}
+                sensitivityA={sensitivities[2]} onSensitivityA={(lvl) => handleSensitivity(2, lvl)}
+                sensitivityB={sensitivities[3]} onSensitivityB={(lvl) => handleSensitivity(3, lvl)}
+                inverted={invertPair1}
+                onInvert={(inv) => handleInvert(1, inv)}
+              />
+            )}
 
             {/* Controls */}
             <Text style={styles.sectionTitle}>CONTROLS</Text>
 
-            <Text style={styles.controlLabel}>SENSITIVITY</Text>
+            <Text style={styles.controlLabel}>SENSOR MODE</Text>
             <View style={styles.btnRow}>
-              {['LOW', 'MED', 'HIGH'].map((lbl, i) => (
+              {[2, 4].map((mode) => (
                 <TouchableOpacity
-                  key={i}
-                  style={[styles.segBtn, sensitivity === i && styles.segBtnActive]}
-                  onPress={() => handleSensitivity(i)}
+                  key={mode}
+                  style={[styles.segBtn, sensorMode === mode && styles.segBtnActive]}
+                  onPress={() => handleSensorMode(mode)}
                 >
-                  <Text style={[styles.segBtnText, sensitivity === i && styles.segBtnTextActive]}>{lbl}</Text>
+                  <Text style={[styles.segBtnText, sensorMode === mode && styles.segBtnTextActive]}>
+                    {mode} SENSORS
+                  </Text>
                 </TouchableOpacity>
               ))}
-            </View>
-
-            <Text style={styles.controlLabel}>DIRECTION</Text>
-            <View style={styles.btnRow}>
-              <TouchableOpacity style={styles.segBtn} onPress={() => sendCommand('3')}>
-                <Text style={styles.segBtnText}>NORMAL</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.segBtn} onPress={() => sendCommand('4')}>
-                <Text style={styles.segBtnText}>INVERT</Text>
-              </TouchableOpacity>
             </View>
 
             <TouchableOpacity style={styles.calibrateBtn} onPress={() => sendCommand('5')}>
@@ -516,25 +668,39 @@ const styles = StyleSheet.create({
   sectionTitle:    { fontSize: 10, color: C.textDim, letterSpacing: 3, fontWeight: '700',
                      marginBottom: 10, marginTop: 8 },
 
-  dirRow:          { flexDirection: 'row', alignItems: 'center', marginBottom: 16, gap: 8 },
+  dirRow:          { flexDirection: 'row', alignItems: 'center', marginBottom: 8, gap: 8 },
   dirArrow:        { flex: 1, borderRadius: 8, paddingVertical: 20, alignItems: 'center', justifyContent: 'center' },
   dirArrowText:    { fontSize: 28 },
   dirCenter:       { flex: 1, alignItems: 'center' },
+  dirPairLabel:    { fontSize: 9, color: C.textDim, letterSpacing: 2, fontWeight: '700', marginBottom: 2 },
   dirLabel:        { fontSize: 16, fontWeight: '700', color: C.textDim, letterSpacing: 2 },
   dirLabelActive:  { color: C.text },
 
-  sensorBlock:     { backgroundColor: C.surface, borderRadius: 10, padding: 14,
-                     marginBottom: 10, borderWidth: 1, borderColor: C.border },
+  pairBlock:       { backgroundColor: C.surface, borderRadius: 12, padding: 14,
+                     marginBottom: 14, borderWidth: 1, borderColor: C.border },
+  pairHeader:      { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  pairLabel:       { fontSize: 11, color: C.text, fontWeight: '800', letterSpacing: 2 },
+  invertRow:       { flexDirection: 'row', gap: 6 },
+  cardRow:         { flexDirection: 'row', gap: 10 },
+
+  sensorCard:      { backgroundColor: '#0d1525', borderRadius: 8, padding: 10,
+                     borderWidth: 1, borderColor: C.border },
   sensorHeader:    { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
-  sensorLabel:     { color: C.text, fontWeight: '700', fontSize: 14, letterSpacing: 1 },
-  sensorMeta:      { flexDirection: 'row', gap: 12, alignItems: 'center' },
-  sensorActive:    { fontSize: 10, color: C.dim, fontWeight: '700', letterSpacing: 1.5 },
+  sensorLabel:     { color: C.text, fontWeight: '700', fontSize: 13, letterSpacing: 1 },
+  sensorMeta:      { flexDirection: 'row', gap: 8, alignItems: 'center' },
+  sensorActive:    { fontSize: 9, color: C.dim, fontWeight: '700', letterSpacing: 1.5 },
   sensorActiveOn:  { color: C.accent },
-  battText:        { fontSize: 11, color: C.textDim },
+  battText:        { fontSize: 10, color: C.textDim },
   barTrack:        { height: 6, backgroundColor: '#1a2535', borderRadius: 3, position: 'relative', overflow: 'visible' },
   barFill:         { height: 6, borderRadius: 3 },
   barThreshold:    { position: 'absolute', top: -3, width: 2, height: 12, backgroundColor: C.warn, borderRadius: 1 },
-  sensorValue:     { color: C.textDim, fontSize: 11, marginTop: 6, textAlign: 'right' },
+  sensorValue:     { color: C.textDim, fontSize: 10, marginTop: 5, textAlign: 'right' },
+  sensRow:         { flexDirection: 'row', gap: 4, marginTop: 8 },
+  sensBtn:         { flex: 1, borderWidth: 1, borderColor: C.border, borderRadius: 4,
+                     paddingVertical: 5, alignItems: 'center', backgroundColor: C.surface },
+  sensBtnActive:   { borderColor: C.accent, backgroundColor: '#001820' },
+  sensBtnText:     { color: C.textDim, fontSize: 10, fontWeight: '700' },
+  sensBtnTextActive: { color: C.accent },
 
   controlLabel:    { color: C.textDim, fontSize: 10, letterSpacing: 2, fontWeight: '700', marginBottom: 8 },
   btnRow:          { flexDirection: 'row', gap: 8, marginBottom: 16 },

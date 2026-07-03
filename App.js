@@ -20,7 +20,7 @@ const SERVICE_UUID      = '12345678-1234-1234-1234-123456789abc';
 const SENSOR_DATA_UUID  = '12345678-1234-1234-1234-123456789abd';
 const BATTERY_DATA_UUID = '12345678-1234-1234-1234-123456789abe';
 const COMMAND_UUID      = '12345678-1234-1234-1234-123456789abf';
-const CONFIG_UUID       = '12345678-1234-1234-1234-123456789ac0';  //Claude: one-shot config packet on connect
+const CONFIG_UUID       = '12345678-1234-1234-1234-123456789ac0';
 const DEVICE_NAME       = 'TetraRadio';
 
 // ─── Real BLE Hook ────────────────────────────────────────────────────────────
@@ -29,22 +29,21 @@ function useBLE() {
     radioDetected: false,
     radioConnected: false,
     scanning: false,
-    sensorDropped: false,  //Claude: true when sensor data has been silent for >3s
+    sensorDropped: false,  //true when sensor data has been silent for >3s
     sensorMode: 2,
     sensitivities: [1, 1, 1, 1],
     invertPair0: false,
     invertPair1: false,
     direction0: 0, val0: 0, val1: 0,
     direction1: 0, val2: 0, val3: 0,
-    battT2: 0,
-    battT3: 0,
+    battLevels: [0, 0, 0, 0],
     log: ['Ready. Press SCAN to find TetraRadio.'],
   });
 
   const managerRef   = useRef(null);
   const deviceRef    = useRef(null);
   const scanTimerRef = useRef(null);
-  const lastDataTime = useRef(null);  //Claude: timestamp of last received sensor notification
+  const lastDataTime = useRef(null);
 
   // Initialise BLE manager once
   useEffect(() => {
@@ -103,17 +102,12 @@ function useBLE() {
           // Bytes 5-9 are only valid in 4-sensor mode; in 2-sensor mode firmware
           // sends 5 bytes so we guard with length checks.
           const bytes = Buffer.from(characteristic.value, 'base64');
-          console.log('payload length:', bytes.length, Array.from(bytes));
           const direction0 = bytes[0];
           const val0 = (bytes[1] << 8) | bytes[2];
           const val1 = (bytes[3] << 8) | bytes[4];
           const direction1 = bytes.length >= 10 ? bytes[5] : 0;
           const val2 = bytes.length >= 10 ? (bytes[6] << 8) | bytes[7] : 0;
           const val3 = bytes.length >= 10 ? (bytes[8] << 8) | bytes[9] : 0;
-
-//          if(bytes.length >= 10){
-//            console.log('Vals :', val2, val3);
-//          }
           lastDataTime.current = Date.now();
           setState(prev => ({
             ...prev,
@@ -132,7 +126,7 @@ function useBLE() {
           );
           if (battChar?.value) {
             const bytes = Buffer.from(battChar.value, 'base64');
-            setState(prev => ({ ...prev, battT2: bytes[0], battT3: bytes[1] }));
+            setState(prev => ({ ...prev, battLevels: [bytes[0], bytes[1], bytes[2] ?? 0, bytes[3] ?? 0] }));
           }
         } catch (e) {
           // Non-fatal — battery read failure doesn't affect sensor data
@@ -145,7 +139,7 @@ function useBLE() {
       device.onDisconnected(() => {
         clearInterval(battInterval);
         deviceRef.current = null;
-        lastDataTime.current = null;  //Claude: clear so drop detector doesn't fire after disconnect
+        lastDataTime.current = null;
         setState(prev => ({
           ...prev,
           radioDetected: false,
@@ -153,15 +147,14 @@ function useBLE() {
           sensorDropped: false,
           direction0: 0, val0: 0, val1: 0,
           direction1: 0, val2: 0, val3: 0,
-          battT2: 0,
-          battT3: 0,
+          battLevels: [0, 0, 0, 0],
         }));
         addLog('TetraRadio disconnected');
       });
 
       addLog('Subscribed to sensor data');
 
-      // Claude: Monitor config characteristic — firmware sends one packet on phone connect
+      // Monitor config characteristic — firmware sends one packet on phone connect
       // with current settings so app display matches firmware state.
       // Packet: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
       device.monitorCharacteristicForService(
@@ -260,8 +253,7 @@ function useBLE() {
       scanning: false,
       direction0: 0, val0: 0, val1: 0,
       direction1: 0, val2: 0, val3: 0,
-      battT2: 0,
-      battT3: 0,
+      battLevels: [0, 0, 0, 0],
     }));
     addLog('Disconnected');
   }, [addLog]);
@@ -290,7 +282,7 @@ function useBLE() {
     };
   }, []);
 
-  // Claude: sensitivity command chars per sensor: 0='0'/'1'/'2', 1='6'/'7'/'8', 2='i'/'j'/'k', 3='l'/'m'/'n'
+  // sensitivity command chars per sensor: 0='0'/'1'/'2', 1='6'/'7'/'8', 2='i'/'j'/'k', 3='l'/'m'/'n'
   const SENS_CMDS = [
     ['0','1','2'],
     ['6','7','8'],
@@ -312,7 +304,7 @@ function useBLE() {
     sendCommand(SENS_CMDS[sensorIndex][level]);
   }, [sendCommand]);
 
-  const handleInvert = useCallback((pair, inverted) => {  //Claude: pair 0 = left/right, pair 1 = wedge
+  const handleInvert = useCallback((pair, inverted) => {  //pair 0 = left/right, pair 1 = wedge
     setState(prev => pair === 0
       ? { ...prev, invertPair0: inverted }
       : { ...prev, invertPair1: inverted }
@@ -321,7 +313,7 @@ function useBLE() {
     else            sendCommand(inverted ? 'h' : 'g');
   }, [sendCommand]);
 
-  // Claude: Poll every second while radio is connected. If sensor data has been
+  // Poll every second while radio is connected. If sensor data has been
   // silent for >3s, flag sensorDropped. Clears automatically when data resumes.
   // Pure observer — never sends commands or interferes with firmware reconnect.
   useEffect(() => {
@@ -485,7 +477,7 @@ function SensorPairBlock({ pairLabel, labelA, labelB, valA, valB, battA, battB,
 
 
 // ─── Connection Status Badge ──────────────────────────────────────────────────
-function StatusBadge({ detected, connected, scanning, sensorDropped }) {  //Claude: added sensorDropped
+function StatusBadge({ detected, connected, scanning, sensorDropped }) {
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
@@ -502,7 +494,6 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {  //Clau
     }
   }, [scanning, sensorDropped]);
 
-  //Claude: sensorDropped takes priority over connected — it is a sub-state of connected
   const color    = sensorDropped ? '#ff6d00' : connected ? '#00e5ff' : detected ? '#ffd600' : scanning ? '#888' : '#f44336';
   const label    = sensorDropped ? 'SENSOR DROPPED' : connected ? 'CONNECTED' : detected ? 'DETECTED' : scanning ? 'SCANNING' : 'NOT FOUND';
   const sublabel = sensorDropped ? 'Reconnecting to sensor...' : connected ? 'TetraRadio' : detected ? 'Connecting...' : scanning ? 'Looking for TetraRadio' : 'Radio controller offline';
@@ -525,7 +516,7 @@ export default function App() {
   const { radioDetected, radioConnected, scanning, sensorDropped,
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
-          battT2, battT3, log } = state;
+          battLevels, log } = state;
 
   const [showLog, setShowLog] = useState(false);
 
@@ -566,8 +557,8 @@ export default function App() {
 
             <SensorPairBlock
               pairLabel="LEFT / RIGHT"
-              labelA="Left"   valA={val0} battA={battT2}
-              labelB="Right"  valB={val1} battB={battT3}
+              labelA="Left"   valA={val0} battA={battLevels[0]}
+              labelB="Right"  valB={val1} battB={battLevels[1]}
               threshold={512}
               sensitivityA={sensitivities[0]} onSensitivityA={(lvl) => handleSensitivity(0, lvl)}
               sensitivityB={sensitivities[1]} onSensitivityB={(lvl) => handleSensitivity(1, lvl)}
@@ -578,8 +569,8 @@ export default function App() {
             {sensorMode === 4 && (
               <SensorPairBlock
                 pairLabel="WEDGE IN / WEDGE OUT"
-                labelA="Wedge In"  valA={val2} battA={0}
-                labelB="Wedge Out" valB={val3} battB={0}
+                labelA="Wedge In"  valA={val2} battA={battLevels[2]}
+                labelB="Wedge Out" valB={val3} battB={battLevels[3]}
                 threshold={512}
                 sensitivityA={sensitivities[2]} onSensitivityA={(lvl) => handleSensitivity(2, lvl)}
                 sensitivityB={sensitivities[3]} onSensitivityB={(lvl) => handleSensitivity(3, lvl)}

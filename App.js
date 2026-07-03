@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useContext, useMemo } from 'react';
 import {
   View,
   Text,
@@ -22,6 +22,8 @@ const BATTERY_DATA_UUID = '12345678-1234-1234-1234-123456789abe';
 const COMMAND_UUID      = '12345678-1234-1234-1234-123456789abf';
 const CONFIG_UUID       = '12345678-1234-1234-1234-123456789ac0';
 const DEVICE_NAME       = 'TetraRadio';
+
+const ThemeContext = React.createContext(null);
 
 // ─── Real BLE Hook ────────────────────────────────────────────────────────────
 function useBLE() {
@@ -336,6 +338,7 @@ function useBLE() {
 // direction0: 0=idle, 1=left, 2=right
 // direction1: 0=idle, 3=wedge in, 4=wedge out
 function DirectionIndicator({ direction0, direction1, sensorMode }) {
+  const { colors, styles } = useContext(ThemeContext);
   const leftAnim    = useRef(new Animated.Value(0)).current;
   const rightAnim   = useRef(new Animated.Value(0)).current;
   const wedgeInAnim = useRef(new Animated.Value(0)).current;
@@ -350,8 +353,8 @@ function DirectionIndicator({ direction0, direction1, sensorMode }) {
     ]).start();
   }, [direction0, direction1]);
 
-  const mkBg  = (anim) => anim.interpolate({ inputRange: [0,1], outputRange: ['#1a2030', '#00e5ff'] });
-  const mkTxt = (anim) => anim.interpolate({ inputRange: [0,1], outputRange: ['#3a4a60', '#001820'] });
+  const mkBg  = (anim) => anim.interpolate({ inputRange: [0,1], outputRange: [colors.dirInactiveBg, colors.accent] });
+  const mkTxt = (anim) => anim.interpolate({ inputRange: [0,1], outputRange: [colors.dirInactiveText, colors.accentText] });
 
   return (
     <View style={{ marginBottom: 16 }}>
@@ -395,6 +398,7 @@ function DirectionIndicator({ direction0, direction1, sensorMode }) {
 
 // ─── Sensor Card Component ────────────────────────────────────────────────────
 function SensorCard({ label, value, max = 1023, threshold, battery, sensitivityIndex, onSensitivity }) {
+  const { colors, styles } = useContext(ThemeContext);
   const fillPct = Math.min(value / max, 1);
   const isActive = value > threshold;
 
@@ -412,7 +416,7 @@ function SensorCard({ label, value, max = 1023, threshold, battery, sensitivityI
         </View>
       </View>
       <View style={styles.barTrack}>
-        <View style={[styles.barFill, { width: `${fillPct * 100}%`, backgroundColor: isActive ? '#00e5ff' : '#2a4060' }]} />
+        <View style={[styles.barFill, { width: `${fillPct * 100}%`, backgroundColor: isActive ? colors.accent : colors.inactiveBar }]} />
         {threshold > 0 && (
           <View style={[styles.barThreshold, { left: `${(threshold / max) * 100}%` }]} />
         )}
@@ -438,6 +442,7 @@ function SensorCard({ label, value, max = 1023, threshold, battery, sensitivityI
 function SensorPairBlock({ pairLabel, labelA, labelB, valA, valB, battA, battB,
                            threshold, sensitivityA, sensitivityB, inverted,
                            onSensitivityA, onSensitivityB, onInvert }) {
+  const { styles } = useContext(ThemeContext);
   return (
     <View style={styles.pairBlock}>
       <View style={styles.pairHeader}>
@@ -478,6 +483,7 @@ function SensorPairBlock({ pairLabel, labelA, labelB, valA, valB, battA, battB,
 
 // ─── Connection Status Badge ──────────────────────────────────────────────────
 function StatusBadge({ detected, connected, scanning, sensorDropped }) {
+  const { colors, styles } = useContext(ThemeContext);
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
@@ -494,7 +500,7 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {
     }
   }, [scanning, sensorDropped]);
 
-  const color    = sensorDropped ? '#ff6d00' : connected ? '#00e5ff' : detected ? '#ffd600' : scanning ? '#888' : '#f44336';
+  const color    = sensorDropped ? colors.dropped : connected ? colors.accent : detected ? colors.warn : scanning ? colors.scanningDot : colors.danger;
   const label    = sensorDropped ? 'SENSOR DROPPED' : connected ? 'CONNECTED' : detected ? 'DETECTED' : scanning ? 'SCANNING' : 'NOT FOUND';
   const sublabel = sensorDropped ? 'Reconnecting to sensor...' : connected ? 'TetraRadio' : detected ? 'Connecting...' : scanning ? 'Looking for TetraRadio' : 'Radio controller offline';
 
@@ -519,15 +525,29 @@ export default function App() {
           battLevels, log } = state;
 
   const [showLog, setShowLog] = useState(false);
+  const [theme, setTheme] = useState('dark');
+  const colors = theme === 'dark' ? darkColors : lightColors;
+  const styles = useMemo(() => createStyles(colors), [colors]);
 
   return (
+    <ThemeContext.Provider value={{ colors, styles }}>
     <View style={styles.root}>
-      <StatusBar barStyle="light-content" backgroundColor="#0a0f1a" />
+      <StatusBar barStyle={colors.statusBarStyle} backgroundColor={colors.bg} />
 
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>TETRASKI</Text>
-        <Text style={styles.headerSub}>Radio Controller Interface</Text>
+        <View style={styles.headerRow}>
+          <View>
+            <Text style={styles.headerTitle}>TETRASKI</Text>
+            <Text style={styles.headerSub}>Radio Controller Interface</Text>
+          </View>
+          <TouchableOpacity
+            style={styles.themeToggle}
+            onPress={() => setTheme(t => (t === 'dark' ? 'light' : 'dark'))}
+          >
+            <Text style={styles.themeToggleText}>{theme === 'dark' ? '☀️' : '🌙'}</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
@@ -619,31 +639,75 @@ export default function App() {
         <View style={{ height: 40 }} />
       </ScrollView>
     </View>
+    </ThemeContext.Provider>
   );
 }
 
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
-const C = {
-  bg:       '#0a0f1a',
-  surface:  '#111827',
-  border:   '#1e2d42',
-  accent:   '#00e5ff',
-  warn:     '#ffd600',
-  dim:      '#3a4a60',
-  text:     '#c8d8e8',
-  textDim:  '#4a6080',
+// ─── Theme Palettes ───────────────────────────────────────────────────────────
+const darkColors = {
+  bg:            '#0a0f1a',
+  surface:       '#111827',
+  surfaceAlt:    '#0d1525',
+  border:        '#1e2d42',
+  accent:        '#00e5ff',
+  accentText:    '#001820',
+  accentSurface: '#001820',
+  warn:          '#ffd600',
+  danger:        '#f44336',
+  dropped:       '#ff6d00',
+  scanningDot:   '#888888',
+  dim:           '#3a4a60',
+  text:          '#c8d8e8',
+  textDim:       '#4a6080',
+  textBright:    '#ffffff',
+  inactiveBar:   '#2a4060',
+  trackBg:       '#1a2535',
+  dirInactiveBg:   '#1a2030',
+  dirInactiveText: '#3a4a60',
+  logBg:         '#080d15',
+  logText:       '#3a7a5a',
+  statusBarStyle: 'light-content',
 };
 
-const styles = StyleSheet.create({
+const lightColors = {
+  bg:            '#f4f6fa',
+  surface:       '#ffffff',
+  surfaceAlt:    '#eef1f6',
+  border:        '#d5dce6',
+  accent:        '#0091a8',
+  accentText:    '#ffffff',
+  accentSurface: '#e0f7fa',
+  warn:          '#b8860b',
+  danger:        '#d32f2f',
+  dropped:       '#e65100',
+  scanningDot:   '#9aa5b1',
+  dim:           '#aab4c2',
+  text:          '#1a2436',
+  textDim:       '#5b6b80',
+  textBright:    '#0a0f1a',
+  inactiveBar:   '#dde3ec',
+  trackBg:       '#e4e9f0',
+  dirInactiveBg:   '#e4e9f0',
+  dirInactiveText: '#9aa5b1',
+  logBg:         '#eef1f6',
+  logText:       '#2f7a52',
+  statusBarStyle: 'dark-content',
+};
+
+const createStyles = (C) => StyleSheet.create({
   root:            { flex: 1, backgroundColor: C.bg },
   scroll:          { flex: 1 },
   scrollContent:   { padding: 16 },
 
   header:          { paddingTop: 56, paddingBottom: 16, paddingHorizontal: 20, backgroundColor: C.bg },
-  headerTitle:     { fontSize: 26, fontWeight: '900', color: '#fff', letterSpacing: 4 },
+  headerRow:       { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  headerTitle:     { fontSize: 26, fontWeight: '900', color: C.textBright, letterSpacing: 4 },
   headerAccent:    { color: C.accent },
   headerSub:       { fontSize: 11, color: C.textDim, letterSpacing: 2, marginTop: 2 },
+  themeToggle:     { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center',
+                     backgroundColor: C.surface, borderWidth: 1, borderColor: C.border },
+  themeToggleText: { fontSize: 18 },
 
   statusCard:      { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface,
                      borderRadius: 10, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: C.border, gap: 14 },
@@ -653,8 +717,8 @@ const styles = StyleSheet.create({
 
   mainBtn:         { backgroundColor: C.accent, borderRadius: 8, paddingVertical: 14,
                      alignItems: 'center', marginBottom: 20 },
-  mainBtnDisconnect: { backgroundColor: '#1e2d42', borderWidth: 1, borderColor: '#f44336' },
-  mainBtnText:     { color: '#001820', fontWeight: '800', letterSpacing: 2, fontSize: 13 },
+  mainBtnDisconnect: { backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.danger },
+  mainBtnText:     { color: C.accentText, fontWeight: '800', letterSpacing: 2, fontSize: 13 },
 
   sectionTitle:    { fontSize: 10, color: C.textDim, letterSpacing: 3, fontWeight: '700',
                      marginBottom: 10, marginTop: 8 },
@@ -674,7 +738,7 @@ const styles = StyleSheet.create({
   invertRow:       { flexDirection: 'row', gap: 6 },
   cardRow:         { flexDirection: 'row', gap: 10 },
 
-  sensorCard:      { backgroundColor: '#0d1525', borderRadius: 8, padding: 10,
+  sensorCard:      { backgroundColor: C.surfaceAlt, borderRadius: 8, padding: 10,
                      borderWidth: 1, borderColor: C.border },
   sensorHeader:    { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 },
   sensorLabel:     { color: C.text, fontWeight: '700', fontSize: 13, letterSpacing: 1 },
@@ -682,14 +746,14 @@ const styles = StyleSheet.create({
   sensorActive:    { fontSize: 9, color: C.dim, fontWeight: '700', letterSpacing: 1.5 },
   sensorActiveOn:  { color: C.accent },
   battText:        { fontSize: 10, color: C.textDim },
-  barTrack:        { height: 6, backgroundColor: '#1a2535', borderRadius: 3, position: 'relative', overflow: 'visible' },
+  barTrack:        { height: 6, backgroundColor: C.trackBg, borderRadius: 3, position: 'relative', overflow: 'visible' },
   barFill:         { height: 6, borderRadius: 3 },
   barThreshold:    { position: 'absolute', top: -3, width: 2, height: 12, backgroundColor: C.warn, borderRadius: 1 },
   sensorValue:     { color: C.textDim, fontSize: 10, marginTop: 5, textAlign: 'right' },
   sensRow:         { flexDirection: 'row', gap: 4, marginTop: 8 },
   sensBtn:         { flex: 1, borderWidth: 1, borderColor: C.border, borderRadius: 4,
                      paddingVertical: 5, alignItems: 'center', backgroundColor: C.surface },
-  sensBtnActive:   { borderColor: C.accent, backgroundColor: '#001820' },
+  sensBtnActive:   { borderColor: C.accent, backgroundColor: C.accentSurface },
   sensBtnText:     { color: C.textDim, fontSize: 10, fontWeight: '700' },
   sensBtnTextActive: { color: C.accent },
 
@@ -697,7 +761,7 @@ const styles = StyleSheet.create({
   btnRow:          { flexDirection: 'row', gap: 8, marginBottom: 16 },
   segBtn:          { flex: 1, borderWidth: 1, borderColor: C.border, borderRadius: 6,
                      paddingVertical: 10, alignItems: 'center', backgroundColor: C.surface },
-  segBtnActive:    { borderColor: C.accent, backgroundColor: '#001820' },
+  segBtnActive:    { borderColor: C.accent, backgroundColor: C.accentSurface },
   segBtnText:      { color: C.textDim, fontSize: 11, fontWeight: '700', letterSpacing: 1 },
   segBtnTextActive: { color: C.accent },
 
@@ -707,8 +771,8 @@ const styles = StyleSheet.create({
 
   logToggle:       { alignItems: 'center', paddingVertical: 10 },
   logToggleText:   { color: C.textDim, fontSize: 10, letterSpacing: 2, fontWeight: '700' },
-  logBox:          { backgroundColor: '#080d15', borderRadius: 8, padding: 12,
+  logBox:          { backgroundColor: C.logBg, borderRadius: 8, padding: 12,
                      borderWidth: 1, borderColor: C.border },
-  logLine:         { color: '#3a7a5a', fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  logLine:         { color: C.logText, fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
                      lineHeight: 16 },
 });

@@ -358,6 +358,13 @@ function DirectionIndicator({ direction0, direction1, sensorMode }) {
 
   return (
     <View style={{ marginBottom: 16 }}>
+      {/* Wedge In (up) — only in 4-sensor mode, sits above the L/R row like a D-pad */}
+      {sensorMode === 4 && (
+        <Animated.View style={[styles.dirArrowVert, styles.dirArrowUp, { backgroundColor: mkBg(wedgeInAnim) }]}>
+          <Animated.Text style={[styles.dirArrowText, { color: mkTxt(wedgeInAnim) }]}>▲</Animated.Text>
+        </Animated.View>
+      )}
+
       {/* Pair 0: Left / Right */}
       <View style={styles.dirRow}>
         <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(leftAnim) }]}>
@@ -368,28 +375,25 @@ function DirectionIndicator({ direction0, direction1, sensorMode }) {
           <Text style={[styles.dirLabel, direction0 === 0 && styles.dirLabelActive]}>
             {direction0 === 0 ? 'IDLE' : direction0 === 1 ? 'LEFT' : 'RIGHT'}
           </Text>
+          {sensorMode === 4 && (
+            <>
+              <Text style={styles.dirPairLabelSecondary}>WEDGE</Text>
+              <Text style={[styles.dirLabelSecondary, direction1 === 0 && styles.dirLabelActive]}>
+                {direction1 === 0 ? 'IDLE' : direction1 === 3 ? 'IN' : 'OUT'}
+              </Text>
+            </>
+          )}
         </View>
         <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(rightAnim) }]}>
           <Animated.Text style={[styles.dirArrowText, { color: mkTxt(rightAnim) }]}>▶</Animated.Text>
         </Animated.View>
       </View>
 
-      {/* Pair 1: Wedge In / Wedge Out — only in 4-sensor mode */}
+      {/* Wedge Out (down) — only in 4-sensor mode, sits below the L/R row like a D-pad */}
       {sensorMode === 4 && (
-        <View style={styles.dirRow}>
-          <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(wedgeInAnim) }]}>
-            <Animated.Text style={[styles.dirArrowText, { color: mkTxt(wedgeInAnim) }]}>▲</Animated.Text>
-          </Animated.View>
-          <View style={styles.dirCenter}>
-            <Text style={styles.dirPairLabel}>WEDGE</Text>
-            <Text style={[styles.dirLabel, direction1 === 0 && styles.dirLabelActive]}>
-              {direction1 === 0 ? 'IDLE' : direction1 === 3 ? 'IN' : 'OUT'}
-            </Text>
-          </View>
-          <Animated.View style={[styles.dirArrow, { backgroundColor: mkBg(wedgeOutAnim) }]}>
-            <Animated.Text style={[styles.dirArrowText, { color: mkTxt(wedgeOutAnim) }]}>▼</Animated.Text>
-          </Animated.View>
-        </View>
+        <Animated.View style={[styles.dirArrowVert, styles.dirArrowDown, { backgroundColor: mkBg(wedgeOutAnim) }]}>
+          <Animated.Text style={[styles.dirArrowText, { color: mkTxt(wedgeOutAnim) }]}>▼</Animated.Text>
+        </Animated.View>
       )}
     </View>
   );
@@ -726,10 +730,17 @@ const createStyles = (C) => StyleSheet.create({
   dirRow:          { flexDirection: 'row', alignItems: 'center', marginBottom: 8, gap: 8 },
   dirArrow:        { flex: 1, borderRadius: 8, paddingVertical: 20, alignItems: 'center', justifyContent: 'center' },
   dirArrowText:    { fontSize: 28 },
+  dirArrowVert:    { width: '34%', alignSelf: 'center', borderRadius: 8, paddingVertical: 16,
+                     alignItems: 'center', justifyContent: 'center' },
+  dirArrowUp:      { marginBottom: 8 },
+  dirArrowDown:    { marginTop: 8 },
   dirCenter:       { flex: 1, alignItems: 'center' },
   dirPairLabel:    { fontSize: 9, color: C.textDim, letterSpacing: 2, fontWeight: '700', marginBottom: 2 },
   dirLabel:        { fontSize: 16, fontWeight: '700', color: C.textDim, letterSpacing: 2 },
   dirLabelActive:  { color: C.text },
+  dirPairLabelSecondary: { fontSize: 8, color: C.textDim, letterSpacing: 2, fontWeight: '700',
+                           marginTop: 8, marginBottom: 2 },
+  dirLabelSecondary: { fontSize: 13, fontWeight: '700', color: C.textDim, letterSpacing: 2 },
 
   pairBlock:       { backgroundColor: C.surface, borderRadius: 12, padding: 14,
                      marginBottom: 14, borderWidth: 1, borderColor: C.border },

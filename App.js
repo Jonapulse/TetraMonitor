@@ -690,7 +690,7 @@ const lightColors = {
   text:          '#1a2436',
   textDim:       '#5b6b80',
   textBright:    '#0a0f1a',
-  inactiveBar:   '#dde3ec',
+  inactiveBar:   '#aaaeb3',
   trackBg:       '#e4e9f0',
   dirInactiveBg:   '#e4e9f0',
   dirInactiveText: '#9aa5b1',

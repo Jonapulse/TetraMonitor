@@ -9,6 +9,7 @@ import {
   StatusBar,
   Platform,
   PermissionsAndroid,
+  PanResponder,
 } from 'react-native';
 
 import { Buffer } from 'buffer';
@@ -33,7 +34,7 @@ function useBLE() {
     scanning: false,
     sensorDropped: false,  //true when sensor data has been silent for >3s
     sensorMode: 2,
-    sensitivities: [1, 1, 1, 1],
+    sensitivities: [50, 50, 50, 50],
     invertPair0: false,
     invertPair1: false,
     direction0: 0, val0: 0, val1: 0,
@@ -284,27 +285,44 @@ function useBLE() {
     };
   }, []);
 
-  // sensitivity command chars per sensor: 0='0'/'1'/'2', 1='6'/'7'/'8', 2='i'/'j'/'k', 3='l'/'m'/'n'
-  const SENS_CMDS = [
-    ['0','1','2'],
-    ['6','7','8'],
-    ['i','j','k'],
-    ['l','m','n'],
-  ];
+  // Sensitivity identifier char per sensor (see MultiSensorAppTest.ino handleCommand):
+  // sensor 0='l', 1='r', 2='u', 3='d', each followed by a two-digit ASCII value 00-99.
+  // Firmware's BLE onWrite() only reads the first byte of each write, so the 3 bytes
+  // are sent as 3 separate single-byte writes rather than one 3-byte write.
+  const SENS_SENSOR_CHARS = ['l', 'r', 'u', 'd'];
+
+  const sendSensitivityCommand = useCallback(async (cmdStr) => {
+    if (!deviceRef.current || !state.radioConnected) return;
+    try {
+      for (const ch of cmdStr) {
+        const b64 = Buffer.from([ch.charCodeAt(0)]).toString('base64');
+        await deviceRef.current.writeCharacteristicWithResponseForService(
+          SERVICE_UUID,
+          COMMAND_UUID,
+          b64
+        );
+      }
+      addLog(`Sent sensitivity command: '${cmdStr}'`);
+    } catch (e) {
+      addLog(`Command error: ${e.message}`);
+    }
+  }, [state.radioConnected, addLog]);
 
   const handleSensorMode = useCallback((mode) => {
     setState(prev => ({ ...prev, sensorMode: mode }));
     sendCommand(mode === 2 ? 'o' : 'p');
   }, [sendCommand]);
 
-  const handleSensitivity = useCallback((sensorIndex, level) => {
+  const handleSensitivity = useCallback((sensorIndex, rawValue) => {
+    const clamped = Math.max(0, Math.min(99, Math.round(rawValue)));
     setState(prev => {
       const next = [...prev.sensitivities];
-      next[sensorIndex] = level;
+      next[sensorIndex] = clamped;
       return { ...prev, sensitivities: next };
     });
-    sendCommand(SENS_CMDS[sensorIndex][level]);
-  }, [sendCommand]);
+    const digits = clamped.toString().padStart(2, '0');
+    sendSensitivityCommand(SENS_SENSOR_CHARS[sensorIndex] + digits);
+  }, [sendSensitivityCommand]);
 
   const handleInvert = useCallback((pair, inverted) => {  //pair 0 = left/right, pair 1 = wedge
     setState(prev => pair === 0
@@ -401,10 +419,47 @@ function DirectionIndicator({ direction0, direction1, sensorMode }) {
 
 
 // ─── Sensor Card Component ────────────────────────────────────────────────────
-function SensorCard({ label, value, max = 1023, threshold, battery, sensitivityIndex, onSensitivity }) {
+// Touching/dragging the bar sets sensitivity: position along the bar maps to a
+// continuous 0-99 value. The BLE command only fires on release, so a drag only
+// sends one command (avoids flooding BLE + triggering repeated NVS saves on
+// every intermediate finger position); the marker previews the value live while dragging.
+function SensorCard({ label, value, max = 200, threshold, battery, sensitivityValue, onSensitivityChange }) {
   const { colors, styles } = useContext(ThemeContext);
   const fillPct = Math.min(value / max, 1);
   const isActive = value > threshold;
+
+  const barWidthRef = useRef(0);
+  const barRef = useRef(null);
+  const barPageXRef = useRef(0);
+  const [previewSensitivity, setPreviewSensitivity] = useState(null);
+
+  const rawValueFromLocationX = useCallback((locationX) => {
+    const width = barWidthRef.current;
+    if (!width) return sensitivityValue;
+    const pct = Math.max(0, Math.min(1, (locationX - barPageXRef.current) / width));
+    return Math.round(pct * 99);
+  }, [sensitivityValue]);
+
+  const panResponder = PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderGrant: (evt) => {
+      setPreviewSensitivity(rawValueFromLocationX(evt.nativeEvent.pageX));
+    },
+    onPanResponderMove: (evt) => {
+      setPreviewSensitivity(rawValueFromLocationX(evt.nativeEvent.pageX));
+    },
+    onPanResponderRelease: (evt) => {
+      const finalValue = rawValueFromLocationX(evt.nativeEvent.pageX);
+      setPreviewSensitivity(null);
+      onSensitivityChange(finalValue);
+    },
+    onPanResponderTerminate: () => {
+      setPreviewSensitivity(null);
+    },
+  });
+
+  const displaySensitivity = previewSensitivity !== null ? previewSensitivity : sensitivityValue;
 
   return (
     <View style={styles.sensorCard}>
@@ -419,24 +474,25 @@ function SensorCard({ label, value, max = 1023, threshold, battery, sensitivityI
           )}
         </View>
       </View>
-      <View style={styles.barTrack}>
+      <View
+        style={styles.barTrack}
+        onLayout={() => {
+          barRef.current?.measure((x, y, width, height, pageX) => {
+            barWidthRef.current = width;
+            barPageXRef.current = pageX;
+          });
+        }}
+        ref={barRef}
+        {...panResponder.panHandlers}
+        hitSlop={{ top: 14, bottom: 14 }}
+      >
         <View style={[styles.barFill, { width: `${fillPct * 100}%`, backgroundColor: isActive ? colors.accent : colors.inactiveBar }]} />
         {threshold > 0 && (
           <View style={[styles.barThreshold, { left: `${(threshold / max) * 100}%` }]} />
         )}
+        <View style={[styles.sensMarker, { left: `${(displaySensitivity / 99) * 100}%`, backgroundColor: colors.accent }]} />
       </View>
       <Text style={styles.sensorValue}>{value}</Text>
-      <View style={styles.sensRow}>
-        {['L','M','H'].map((lbl, i) => (
-          <TouchableOpacity
-            key={i}
-            style={[styles.sensBtn, sensitivityIndex === i && styles.sensBtnActive]}
-            onPress={() => onSensitivity(i)}
-          >
-            <Text style={[styles.sensBtnText, sensitivityIndex === i && styles.sensBtnTextActive]}>{lbl}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
     </View>
   );
 }
@@ -470,13 +526,13 @@ function SensorPairBlock({ pairLabel, labelA, labelB, valA, valB, battA, battB,
         <View style={{ flex: 1 }}>
           <SensorCard
             label={labelA} value={valA} threshold={threshold}
-            battery={battA} sensitivityIndex={sensitivityA} onSensitivity={onSensitivityA}
+            battery={battA} sensitivityValue={sensitivityA} onSensitivityChange={onSensitivityA}
           />
         </View>
         <View style={{ flex: 1 }}>
           <SensorCard
             label={labelB} value={valB} threshold={threshold}
-            battery={battB} sensitivityIndex={sensitivityB} onSensitivity={onSensitivityB}
+            battery={battB} sensitivityValue={sensitivityB} onSensitivityChange={onSensitivityB}
           />
         </View>
       </View>
@@ -583,7 +639,7 @@ export default function App() {
               pairLabel="LEFT / RIGHT"
               labelA="Left"   valA={val0} battA={battLevels[0]}
               labelB="Right"  valB={val1} battB={battLevels[1]}
-              threshold={512}
+              threshold={100}
               sensitivityA={sensitivities[0]} onSensitivityA={(lvl) => handleSensitivity(0, lvl)}
               sensitivityB={sensitivities[1]} onSensitivityB={(lvl) => handleSensitivity(1, lvl)}
               inverted={invertPair0}
@@ -595,7 +651,7 @@ export default function App() {
                 pairLabel="WEDGE IN / WEDGE OUT"
                 labelA="Wedge In"  valA={val2} battA={battLevels[2]}
                 labelB="Wedge Out" valB={val3} battB={battLevels[3]}
-                threshold={512}
+                threshold={100}
                 sensitivityA={sensitivities[2]} onSensitivityA={(lvl) => handleSensitivity(2, lvl)}
                 sensitivityB={sensitivities[3]} onSensitivityB={(lvl) => handleSensitivity(3, lvl)}
                 inverted={invertPair1}
@@ -760,13 +816,8 @@ const createStyles = (C) => StyleSheet.create({
   barTrack:        { height: 6, backgroundColor: C.trackBg, borderRadius: 3, position: 'relative', overflow: 'visible' },
   barFill:         { height: 6, borderRadius: 3 },
   barThreshold:    { position: 'absolute', top: -3, width: 2, height: 12, backgroundColor: C.warn, borderRadius: 1 },
+  sensMarker:      { position: 'absolute', top: -5, width: 4, height: 16, borderRadius: 2, marginLeft: -2 },
   sensorValue:     { color: C.textDim, fontSize: 10, marginTop: 5, textAlign: 'right' },
-  sensRow:         { flexDirection: 'row', gap: 4, marginTop: 8 },
-  sensBtn:         { flex: 1, borderWidth: 1, borderColor: C.border, borderRadius: 4,
-                     paddingVertical: 5, alignItems: 'center', backgroundColor: C.surface },
-  sensBtnActive:   { borderColor: C.accent, backgroundColor: C.accentSurface },
-  sensBtnText:     { color: C.textDim, fontSize: 10, fontWeight: '700' },
-  sensBtnTextActive: { color: C.accent },
 
   controlLabel:    { color: C.textDim, fontSize: 10, letterSpacing: 2, fontWeight: '700', marginBottom: 8 },
   btnRow:          { flexDirection: 'row', gap: 8, marginBottom: 16 },

@@ -7,7 +7,11 @@
       "package": "com.anonymous.TetraMonitor"
     },
     "ios": {
-      "bundleIdentifier": "com.anonymous.TetraMonitor"
+      "bundleIdentifier": "com.anonymous.TetraMonitor",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "TetraSki uses Bluetooth to connect to your radio controller and sensors.",
+        "NSBluetoothPeripheralUsageDescription": "TetraSki uses Bluetooth to connect to your radio controller and sensors."
+      }
     }
   }
 }

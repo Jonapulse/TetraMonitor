@@ -423,7 +423,7 @@ function DirectionIndicator({ direction0, direction1, sensorMode }) {
 // continuous 0-99 value. The BLE command only fires on release, so a drag only
 // sends one command (avoids flooding BLE + triggering repeated NVS saves on
 // every intermediate finger position); the marker previews the value live while dragging.
-function SensorCard({ label, value, max = 200, threshold, battery, sensitivityValue, onSensitivityChange }) {
+function SensorCard({ label, value, max = 160, threshold, battery, sensitivityValue, onSensitivityChange }) {
   const { colors, styles } = useContext(ThemeContext);
   const fillPct = Math.min(value / max, 1);
   const isActive = value > threshold;
@@ -639,7 +639,7 @@ export default function App() {
               pairLabel="LEFT / RIGHT"
               labelA="Left"   valA={val0} battA={battLevels[0]}
               labelB="Right"  valB={val1} battB={battLevels[1]}
-              threshold={100}
+              threshold={80}
               sensitivityA={sensitivities[0]} onSensitivityA={(lvl) => handleSensitivity(0, lvl)}
               sensitivityB={sensitivities[1]} onSensitivityB={(lvl) => handleSensitivity(1, lvl)}
               inverted={invertPair0}
@@ -651,7 +651,7 @@ export default function App() {
                 pairLabel="WEDGE IN / WEDGE OUT"
                 labelA="Wedge In"  valA={val2} battA={battLevels[2]}
                 labelB="Wedge Out" valB={val3} battB={battLevels[3]}
-                threshold={100}
+                threshold={80}
                 sensitivityA={sensitivities[2]} onSensitivityA={(lvl) => handleSensitivity(2, lvl)}
                 sensitivityB={sensitivities[3]} onSensitivityB={(lvl) => handleSensitivity(3, lvl)}
                 inverted={invertPair1}

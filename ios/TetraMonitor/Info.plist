@@ -44,6 +44,10 @@
       <key>NSAllowsLocalNetworking</key>
       <true/>
     </dict>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>TetraSki uses Bluetooth to connect to your radio controller and sensors.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>TetraSki uses Bluetooth to connect to your radio controller and sensors.</string>
     <key>RCTNewArchEnabled</key>
     <true/>
     <key>UILaunchStoryboardName</key>

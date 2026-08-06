@@ -23,7 +23,7 @@
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = TetraMonitor/Info.plist; sourceTree = "<group>"; };
 		3ED30DBF38640FDF6830B7D1 /* Pods-TetraMonitor.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TetraMonitor.release.xcconfig"; path = "Target Support Files/Pods-TetraMonitor/Pods-TetraMonitor.release.xcconfig"; sourceTree = "<group>"; };
 		842CD19C79A7619C9DB7F0C7 /* ExpoModulesProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ExpoModulesProvider.swift; path = "Pods/Target Support Files/Pods-TetraMonitor/ExpoModulesProvider.swift"; sourceTree = "<group>"; };
-		A87C51A3A82FA5D6696CCDE9 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; name = PrivacyInfo.xcprivacy; path = TetraMonitor/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		A87C51A3A82FA5D6696CCDE9 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xml; name = PrivacyInfo.xcprivacy; path = TetraMonitor/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = TetraMonitor/SplashScreen.storyboard; sourceTree = "<group>"; };
 		BB2F792C24A3F905000567C9 /* Expo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; path = Expo.plist; sourceTree = "<group>"; };
 		D1D94EA6E760E21B70A117B5 /* libPods-TetraMonitor.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-TetraMonitor.a"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -81,7 +81,6 @@
 				0445F4EFA46E8AEB438D88B3 /* Pods-TetraMonitor.debug.xcconfig */,
 				3ED30DBF38640FDF6830B7D1 /* Pods-TetraMonitor.release.xcconfig */,
 			);
-			name = Pods;
 			path = Pods;
 			sourceTree = "<group>";
 		};
@@ -275,6 +274,7 @@
 			inputPaths = (
 				"$(SRCROOT)/.xcode.env",
 				"$(SRCROOT)/.xcode.env.local",
+				"$(SRCROOT)/TetraMonitor/TetraMonitor.entitlements",
 				"$(SRCROOT)/Pods/Target Support Files/Pods-TetraMonitor/expo-configure-project.sh",
 			);
 			name = "[Expo] Configure project";
@@ -334,7 +334,9 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = TetraMonitor/TetraMonitor.entitlements;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5Z9UJF8AKX;
 				ENABLE_BITCODE = NO;
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
@@ -353,14 +355,13 @@
 					"-lc++",
 				);
 				OTHER_SWIFT_FLAGS = "$(inherited) -D EXPO_CONFIGURATION_DEBUG";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.anonymous.TetraMonitor";
+				PRODUCT_BUNDLE_IDENTIFIER = com.anonymous.TetraMonitor;
 				PRODUCT_NAME = "TetraMonitor";
 				SWIFT_OBJC_BRIDGING_HEADER = "TetraMonitor/TetraMonitor-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
-				VERSIONING_SYSTEM = "apple-generic";
 				TARGETED_DEVICE_FAMILY = "1";
-				CODE_SIGN_ENTITLEMENTS = TetraMonitor/TetraMonitor.entitlements;
+				VERSIONING_SYSTEM = "apple-generic";
 			};
 			name = Debug;
 		};
@@ -370,7 +371,9 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = TetraMonitor/TetraMonitor.entitlements;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 5Z9UJF8AKX;
 				INFOPLIST_FILE = TetraMonitor/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -384,13 +387,12 @@
 					"-lc++",
 				);
 				OTHER_SWIFT_FLAGS = "$(inherited) -D EXPO_CONFIGURATION_RELEASE";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.anonymous.TetraMonitor";
+				PRODUCT_BUNDLE_IDENTIFIER = com.anonymous.TetraMonitor;
 				PRODUCT_NAME = "TetraMonitor";
 				SWIFT_OBJC_BRIDGING_HEADER = "TetraMonitor/TetraMonitor-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
-				VERSIONING_SYSTEM = "apple-generic";
 				TARGETED_DEVICE_FAMILY = "1";
-				CODE_SIGN_ENTITLEMENTS = TetraMonitor/TetraMonitor.entitlements;
+				VERSIONING_SYSTEM = "apple-generic";
 			};
 			name = Release;
 		};

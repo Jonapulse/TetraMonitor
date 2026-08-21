@@ -41,20 +41,14 @@ function useBLE() {
     direction1: 0, val2: 0, val3: 0,
     battLevels: [0, 0, 0, 0],
     log: ['Ready. Press SCAN to find TetraRadio.'],
-    serialLog: ['Waiting for serial output from radio controller...'],
-    rawLog: [],
   });
 
   const managerRef   = useRef(null);
   const deviceRef    = useRef(null);
   const scanTimerRef = useRef(null);
   const lastDataTime = useRef(null);
-  // Tracks the last direction byte seen per pair so the serial-output log only
-  // records transitions (matching what's meaningful to a human reading it),
-  // not every packet. The firmware itself calls Serial.print(currentDirection)
-  // on every new sensor reading, so the real wire is noisier than this log.
-  const prevDirection0 = useRef(0);
-  const prevDirection1 = useRef(0);
+  const subscriptionsRef = useRef({ sensorSub: null, configSub: null, disconnectSub: null, battInterval: null });
+  const disconnectFallbackRef = useRef(null);
 
   // Initialise BLE manager once
   useEffect(() => {
@@ -71,30 +65,20 @@ function useBLE() {
     }));
   }, []);
 
-  const addSerialLog = useCallback((msg) => {
-    setState(prev => ({
-      ...prev,
-      serialLog: [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.serialLog.slice(0, 49)],
-    }));
+  // Removes every listener/interval registered by subscribeToDevice. Must be
+  // called on every disconnect path (both user-initiated and unexpected) —
+  // otherwise each reconnect stacks another set of listeners onto the
+  // underlying native connection, which is what caused "TetraRadio
+  // disconnected" to fire multiple times per actual disconnect event.
+  const cleanupSubscriptions = useCallback(() => {
+    subscriptionsRef.current.sensorSub?.remove();
+    subscriptionsRef.current.configSub?.remove();
+    subscriptionsRef.current.disconnectSub?.remove();
+    if (subscriptionsRef.current.battInterval) {
+      clearInterval(subscriptionsRef.current.battInterval);
+    }
+    subscriptionsRef.current = { sensorSub: null, configSub: null, disconnectSub: null, battInterval: null };
   }, []);
-
-  // Unlike addSerialLog (transitions only), this records every packet as it
-  // arrives, including repeated idle/zero values — mirrors the raw, noisy
-  // stream the firmware actually writes to TetraSki via Serial.print().
-  const addRawLog = useCallback((msg) => {
-    setState(prev => ({
-      ...prev,
-      rawLog: [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.rawLog.slice(0, 9)],
-    }));
-  }, []);
-
-  // Human-readable label for a direction byte, matching the firmware's
-  // sensorOutputs mapping (see MultiSensorAppTest.ino handleCommand / loop()).
-  // pair 0 = left/right, pair 1 = wedge in/out.
-  const directionLabel = (byte, pair) => {
-    if (pair === 0) return byte === 1 ? 'LEFT' : byte === 2 ? 'RIGHT' : 'IDLE';
-    return byte === 3 ? 'WEDGE IN' : byte === 4 ? 'WEDGE OUT' : 'IDLE';
-  };
 
   // Request Android BLE permissions (Android 12+)
   const requestPermissions = useCallback(async () => {
@@ -121,9 +105,13 @@ function useBLE() {
 
   // Subscribe to sensor data notifications and battery reads
   const subscribeToDevice = useCallback(async (device) => {
+    // Defensive: if subscribeToDevice were ever called again while a previous
+    // connection's listeners are still live, this prevents them from stacking.
+    cleanupSubscriptions();
+
     try {
       // Sensor data — NOTIFY characteristic, fires on every Arduino update
-      device.monitorCharacteristicForService(
+      const sensorSub = device.monitorCharacteristicForService(
         SERVICE_UUID,
         SENSOR_DATA_UUID,
         (error, characteristic) => {
@@ -145,17 +133,6 @@ function useBLE() {
           const val2 = bytes.length >= 10 ? (bytes[6] << 8) | bytes[7] : 0;
           const val3 = bytes.length >= 10 ? (bytes[8] << 8) | bytes[9] : 0;
           lastDataTime.current = Date.now();
-
-          if (direction0 !== prevDirection0.current) {
-            addSerialLog(`Pair0: ${direction0} (${directionLabel(direction0, 0)})`);
-            prevDirection0.current = direction0;
-          }
-          if (bytes.length >= 10 && direction1 !== prevDirection1.current) {
-            addSerialLog(`Pair1: ${direction1} (${directionLabel(direction1, 1)})`);
-            prevDirection1.current = direction1;
-          }
-          addRawLog(`Pair0: ${direction0} (${directionLabel(direction0, 0)})  |  Pair1: ${direction1} (${directionLabel(direction1, 1)})`);
-
           setState(prev => ({
             ...prev,
             direction0, val0, val1,
@@ -163,6 +140,7 @@ function useBLE() {
           }));
         }
       );
+      subscriptionsRef.current.sensorSub = sensorSub;
 
       // Battery — READ characteristic, poll every 5 seconds
       const readBattery = async () => {
@@ -181,14 +159,15 @@ function useBLE() {
       };
       readBattery();
       const battInterval = setInterval(readBattery, 5000);
+      subscriptionsRef.current.battInterval = battInterval;
 
-      // Clean up battery polling when device disconnects
-      device.onDisconnected(() => {
-        clearInterval(battInterval);
+      // Clean up all listeners/intervals when device disconnects — whether
+      // that's from the user tapping disconnect or an unexpected drop.
+      const disconnectSub = device.onDisconnected(() => {
+        clearTimeout(disconnectFallbackRef.current);
+        cleanupSubscriptions();
         deviceRef.current = null;
         lastDataTime.current = null;
-        prevDirection0.current = 0;
-        prevDirection1.current = 0;
         setState(prev => ({
           ...prev,
           radioDetected: false,
@@ -200,13 +179,14 @@ function useBLE() {
         }));
         addLog('TetraRadio disconnected');
       });
+      subscriptionsRef.current.disconnectSub = disconnectSub;
 
       addLog('Subscribed to sensor data');
 
       // Monitor config characteristic — firmware sends one packet on phone connect
       // with current settings so app display matches firmware state.
       // Packet: [sensorCount, inversionFlags, sens0, sens1, sens2, sens3]
-      device.monitorCharacteristicForService(
+      const configSub = device.monitorCharacteristicForService(
         SERVICE_UUID,
         CONFIG_UUID,
         (error, characteristic) => {
@@ -221,10 +201,11 @@ function useBLE() {
           addLog(`Config synced: ${sensorMode} sensors, inv=[${invertPair0},${invertPair1}], sens=[${sensitivities}]`);
         }
       );
+      subscriptionsRef.current.configSub = configSub;
     } catch (e) {
       addLog(`Subscribe error: ${e.message}`);
     }
-  }, [addLog, addSerialLog, addRawLog]);
+  }, [addLog, cleanupSubscriptions]);
 
   const startScan = useCallback(async () => {
     const hasPermission = await requestPermissions();
@@ -251,7 +232,7 @@ function useBLE() {
     }, 15000);
 
     managerRef.current.startDeviceScan(
-      null,   // filter by service UUID so we only see TetraRadio
+      [SERVICE_UUID],   // (Should match PhonePeripheral.ino PHONE_SERVICE_UUID)
       null,
       async (error, device) => {
         if (error) {
@@ -261,24 +242,23 @@ function useBLE() {
           return;
         }
 
-        if (device?.name === DEVICE_NAME) {
-          // Found it — stop scan and connect
-          managerRef.current.stopDeviceScan();
-          clearTimeout(scanTimerRef.current);
-          setState(prev => ({ ...prev, radioDetected: true, scanning: false }));
-          addLog(`Found ${DEVICE_NAME}! Connecting...`);
+        // Anything delivered here already matched the UUID filter above —
+        // no need to check device.name.
+        managerRef.current.stopDeviceScan();
+        clearTimeout(scanTimerRef.current);
+        setState(prev => ({ ...prev, radioDetected: true, scanning: false }));
+        addLog(`Found ${device.name || DEVICE_NAME}! Connecting...`);
 
-          try {
-            const connected = await device.connect();
-            await connected.discoverAllServicesAndCharacteristics();
-            deviceRef.current = connected;
-            setState(prev => ({ ...prev, radioConnected: true }));
-            addLog(`Connected to ${DEVICE_NAME}`);
-            subscribeToDevice(connected);
-          } catch (e) {
-            addLog(`Connection failed: ${e.message}`);
-            setState(prev => ({ ...prev, radioDetected: false }));
-          }
+        try {
+          const connected = await device.connect();
+          await connected.discoverAllServicesAndCharacteristics();
+          deviceRef.current = connected;
+          setState(prev => ({ ...prev, radioConnected: true }));
+          addLog(`Connected to ${DEVICE_NAME}`);
+          subscribeToDevice(connected);
+        } catch (e) {
+          addLog(`Connection failed: ${e.message}`);
+          setState(prev => ({ ...prev, radioDetected: false }));
         }
       }
     );
@@ -287,25 +267,44 @@ function useBLE() {
   const disconnect = useCallback(async () => {
     clearTimeout(scanTimerRef.current);
     managerRef.current?.stopDeviceScan();
-    if (deviceRef.current) {
+
+    const device = deviceRef.current;
+    if (!device) return;
+
+    // Ask the radio to hang up on itself instead of calling cancelConnection() directly
+    let wrote = false;
+    try {
+      const b64 = Buffer.from(['x'.charCodeAt(0)]).toString('base64');
+      await device.writeCharacteristicWithResponseForService(SERVICE_UUID, COMMAND_UUID, b64);
+      wrote = true;
+      addLog('Sent disconnect request to radio');
+    } catch (e) {
+      addLog(`Disconnect request failed: ${e.message}`);
+    }
+
+    // Safety net: if the write itself failed, or the radio never confirms
+    // within a few seconds, force a local teardown so the UI doesn't get stuck.
+    disconnectFallbackRef.current = setTimeout(async () => {
+      if (!deviceRef.current) return; // onDisconnected already handled it
+      addLog('Radio did not confirm disconnect — forcing local teardown');
       try {
         await deviceRef.current.cancelConnection();
       } catch (e) {
-        // Already disconnected — ignore
+        // ignore
       }
+      cleanupSubscriptions();
       deviceRef.current = null;
-    }
-    setState(prev => ({
-      ...prev,
-      radioDetected: false,
-      radioConnected: false,
-      scanning: false,
-      direction0: 0, val0: 0, val1: 0,
-      direction1: 0, val2: 0, val3: 0,
-      battLevels: [0, 0, 0, 0],
-    }));
-    addLog('Disconnected');
-  }, [addLog]);
+      setState(prev => ({
+        ...prev,
+        radioDetected: false,
+        radioConnected: false,
+        scanning: false,
+        direction0: 0, val0: 0, val1: 0,
+        direction1: 0, val2: 0, val3: 0,
+        battLevels: [0, 0, 0, 0],
+      }));
+    }, wrote ? 3000 : 0);
+  }, [addLog, cleanupSubscriptions]);
 
   const sendCommand = useCallback(async (cmd) => {
     if (!deviceRef.current || !state.radioConnected) return;
@@ -327,9 +326,10 @@ function useBLE() {
     return () => {
       clearTimeout(scanTimerRef.current);
       managerRef.current?.stopDeviceScan();
+      cleanupSubscriptions();
       deviceRef.current?.cancelConnection().catch(() => {});
     };
-  }, []);
+  }, [cleanupSubscriptions]);
 
   // Sensitivity identifier char per sensor (see MultiSensorAppTest.ino handleCommand):
   // sensor 0='l', 1='r', 2='u', 3='d', each followed by a two-digit ASCII value 00-99.
@@ -587,47 +587,6 @@ function SensorPairBlock({ pairLabel, labelA, labelB, valA, valB, battA, battB,
 }
 
 
-// ─── Log Stream Dropdown ──────────────────────────────────────────────────────
-const LOG_STREAMS = [
-  { key: 'events', label: 'EVENT LOG' },
-  { key: 'serial', label: 'SERIAL OUTPUT' },
-  { key: 'raw',    label: 'RAW FEED (LAST 10)' },
-];
-
-function LogStreamDropdown({ selected, open, onToggleOpen, onSelect }) {
-  const { styles } = useContext(ThemeContext);
-  const currentLabel = LOG_STREAMS.find(s => s.key === selected)?.label ?? LOG_STREAMS[0].label;
-
-  return (
-    <View style={styles.dropdownWrap}>
-      <TouchableOpacity style={styles.dropdownBtn} onPress={onToggleOpen}>
-        <Text style={styles.dropdownBtnText}>{currentLabel}</Text>
-        <Text style={styles.dropdownCaret}>{open ? '▲' : '▼'}</Text>
-      </TouchableOpacity>
-      {open && (
-        <View style={styles.dropdownMenu}>
-          {LOG_STREAMS.map((s, i) => (
-            <TouchableOpacity
-              key={s.key}
-              style={[
-                styles.dropdownItem,
-                s.key === selected && styles.dropdownItemActive,
-                i === LOG_STREAMS.length - 1 && { borderBottomWidth: 0 },
-              ]}
-              onPress={() => onSelect(s.key)}
-            >
-              <Text style={[styles.dropdownItemText, s.key === selected && styles.dropdownItemTextActive]}>
-                {s.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-      )}
-    </View>
-  );
-}
-
-
 // ─── Connection Status Badge ──────────────────────────────────────────────────
 function StatusBadge({ detected, connected, scanning, sensorDropped }) {
   const { colors, styles } = useContext(ThemeContext);
@@ -669,11 +628,9 @@ export default function App() {
   const { radioDetected, radioConnected, scanning, sensorDropped,
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
-          battLevels, log, serialLog, rawLog } = state;
+          battLevels, log } = state;
 
   const [showLog, setShowLog] = useState(false);
-  const [logStream, setLogStream] = useState('events'); // 'events' | 'serial'
-  const [logDropdownOpen, setLogDropdownOpen] = useState(false);
   const [theme, setTheme] = useState('dark');
   const colors = theme === 'dark' ? darkColors : lightColors;
   const styles = useMemo(() => createStyles(colors), [colors]);
@@ -773,35 +730,15 @@ export default function App() {
         )}
 
         {/* Log Toggle */}
-        <TouchableOpacity
-          style={styles.logToggle}
-          onPress={() => {
-            setShowLog(v => !v);
-            setLogDropdownOpen(false);
-          }}
-        >
+        <TouchableOpacity style={styles.logToggle} onPress={() => setShowLog(v => !v)}>
           <Text style={styles.logToggleText}>{showLog ? '▲ HIDE LOG' : '▼ SHOW LOG'}</Text>
         </TouchableOpacity>
 
         {showLog && (
-          <View>
-            <LogStreamDropdown
-              selected={logStream}
-              open={logDropdownOpen}
-              onToggleOpen={() => setLogDropdownOpen(v => !v)}
-              onSelect={(key) => {
-                setLogStream(key);
-                setLogDropdownOpen(false);
-              }}
-            />
-            <View style={styles.logBox}>
-              {(logStream === 'serial' ? serialLog : logStream === 'raw' ? rawLog : log).length === 0 && (
-                <Text style={styles.logLine}>Waiting for sensor data...</Text>
-              )}
-              {(logStream === 'serial' ? serialLog : logStream === 'raw' ? rawLog : log).map((line, i) => (
-                <Text key={i} style={styles.logLine}>{line}</Text>
-              ))}
-            </View>
+          <View style={styles.logBox}>
+            {log.map((line, i) => (
+              <Text key={i} style={styles.logLine}>{line}</Text>
+            ))}
           </View>
         )}
 
@@ -942,22 +879,6 @@ const createStyles = (C) => StyleSheet.create({
 
   logToggle:       { alignItems: 'center', paddingVertical: 10 },
   logToggleText:   { color: C.textDim, fontSize: 10, letterSpacing: 2, fontWeight: '700' },
-
-  dropdownWrap:    { position: 'relative', zIndex: 10, marginBottom: 8 },
-  dropdownBtn:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
-                     borderWidth: 1, borderColor: C.border, borderRadius: 6,
-                     paddingVertical: 10, paddingHorizontal: 12, backgroundColor: C.surface },
-  dropdownBtnText: { color: C.text, fontSize: 11, fontWeight: '700', letterSpacing: 1.5 },
-  dropdownCaret:   { color: C.textDim, fontSize: 10 },
-  dropdownMenu:    { position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4,
-                     borderWidth: 1, borderColor: C.border, borderRadius: 6,
-                     backgroundColor: C.surface, overflow: 'hidden', zIndex: 20 },
-  dropdownItem:    { paddingVertical: 10, paddingHorizontal: 12,
-                     borderBottomWidth: 1, borderBottomColor: C.border },
-  dropdownItemActive: { backgroundColor: C.accentSurface },
-  dropdownItemText:   { color: C.textDim, fontSize: 11, fontWeight: '700', letterSpacing: 1 },
-  dropdownItemTextActive: { color: C.accent },
-
   logBox:          { backgroundColor: C.logBg, borderRadius: 8, padding: 12,
                      borderWidth: 1, borderColor: C.border },
   logLine:         { color: C.logText, fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',

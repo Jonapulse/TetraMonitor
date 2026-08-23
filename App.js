@@ -14,7 +14,7 @@ import {
 
 import { Buffer } from 'buffer';
 
-import { BleManager, State } from 'react-native-ble-plx';
+import { BleManager, LogLevel, State } from 'react-native-ble-plx';
 
 // ─── BLE UUIDs (must match OTATest.ino) ──────────────────────────────────────
 const SERVICE_UUID      = '12345678-1234-1234-1234-123456789abc';
@@ -32,6 +32,7 @@ function useBLE() {
     radioDetected: false,
     radioConnected: false,
     scanning: false,
+    connecting: false,
     sensorDropped: false,  //true when sensor data has been silent for >3s
     sensorMode: 2,
     sensitivities: [50, 50, 50, 50],
@@ -51,6 +52,7 @@ function useBLE() {
   const lastDataTime = useRef(null);
   const subscriptionsRef = useRef({ sensorSub: null, configSub: null, disconnectSub: null, battInterval: null });
   const disconnectFallbackRef = useRef(null);
+  const isConnectingRef = useRef(false);
 
   const prevDirection0 = useRef(0);
   const prevDirection1 = useRef(0);
@@ -58,6 +60,7 @@ function useBLE() {
   // Initialise BLE manager once
   useEffect(() => {
     managerRef.current = new BleManager();
+    managerRef.current.setLogLevel(LogLevel.Verbose);
     return () => {
       managerRef.current?.destroy();
     };
@@ -69,6 +72,8 @@ function useBLE() {
       log: [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.log.slice(0, 49)],
     }));
   }, []);
+
+  const resetConnectingGuard = () => { isConnectingRef.current = false; };
 
   // Removes every listener/interval registered by subscribeToDevice. Must be
   // called on every disconnect path (both user-initiated and unexpected) —
@@ -251,9 +256,16 @@ function useBLE() {
   }, [addLog, cleanupSubscriptions, addSerialLog, addRawLog]);
 
   const startScan = useCallback(async () => {
+    if (isConnectingRef.current) {
+      addLog('Already scanning/connecting — ignoring');
+      return;
+    }
+    isConnectingRef.current = true;
+
     const hasPermission = await requestPermissions();
     if (!hasPermission) {
       addLog('Bluetooth permissions denied');
+      resetConnectingGuard();
       return;
     }
 
@@ -261,6 +273,7 @@ function useBLE() {
     const bleState = await managerRef.current.state();
     if (bleState !== State.PoweredOn) {
       addLog('Bluetooth is off — please enable it');
+      resetConnectingGuard();
       return;
     }
 
@@ -272,16 +285,18 @@ function useBLE() {
       managerRef.current?.stopDeviceScan();
       setState(prev => ({ ...prev, scanning: false }));
       addLog('Scan timeout — TetraRadio not found');
+      resetConnectingGuard();
     }, 15000);
 
     managerRef.current.startDeviceScan(
-      [SERVICE_UUID],   // (Should match PhonePeripheral.ino PHONE_SERVICE_UUID)
+      [SERVICE_UUID],   // (Should match PhonePeripheral.ino PHONE_SERVICE_UUIxqD)
       null,
       async (error, device) => {
         if (error) {
           addLog(`Scan error: ${error.message}`);
           setState(prev => ({ ...prev, scanning: false }));
           clearTimeout(scanTimerRef.current);
+          resetConnectingGuard();
           return;
         }
 
@@ -289,19 +304,35 @@ function useBLE() {
         // no need to check device.name.
         managerRef.current.stopDeviceScan();
         clearTimeout(scanTimerRef.current);
-        setState(prev => ({ ...prev, radioDetected: true, scanning: false }));
+        setState(prev => ({ ...prev, radioDetected: true, scanning: false, connecting: true }));
         addLog(`Found ${device.name || DEVICE_NAME}! Connecting...`);
 
         try {
+          await new Promise(resolve => setTimeout(resolve, 300)); //TODO: Check if you we need this debug thing
           const connected = await device.connect();
           await connected.discoverAllServicesAndCharacteristics();
           deviceRef.current = connected;
-          setState(prev => ({ ...prev, radioConnected: true }));
+          setState(prev => ({ ...prev, radioConnected: true, connecting: false}));
           addLog(`Connected to ${DEVICE_NAME}`);
           subscribeToDevice(connected);
-        } catch (e) {
+          resetConnectingGuard();
+        } catch (e) { 
           addLog(`Connection failed: ${e.message}`);
-          setState(prev => ({ ...prev, radioDetected: false }));
+          addLog(`  errorCode=${e.errorCode} reason=${e.reason}`);
+          addLog(`  androidErrorCode=${e.androidErrorCode} androidCode=${e.attErrorCode}`);
+          addLog(`  iosErrorCode=${e.iosErrorCode}`);
+          console.log('Full BLE error:', JSON.stringify(e, null, 2));
+
+          // Release the native GATT client even though connect failed —
+          // otherwise it can leak and exhaust Android's GATT client slots.
+          //TODO: Check if we need this debug thing
+          try {
+            await device.cancelConnection();
+          } catch (_) {
+            // already gone, fine
+          }
+          setState(prev => ({ ...prev, radioDetected: false, connecting: false}));
+          resetConnectingGuard();
         }
       }
     );
@@ -709,7 +740,7 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert } = useBLE();
-  const { radioDetected, radioConnected, scanning, sensorDropped,
+  const { radioDetected, radioConnected, scanning, connecting, sensorDropped,
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
           battLevels, log, serialLog, rawLog } = state;
@@ -751,10 +782,10 @@ export default function App() {
         <TouchableOpacity
           style={[styles.mainBtn, radioConnected && styles.mainBtnDisconnect]}
           onPress={radioConnected ? disconnect : startScan}
-          disabled={scanning}
+          disabled={scanning || connecting}
         >
           <Text style={styles.mainBtnText}>
-            {scanning ? 'SCANNING...' : radioConnected ? 'DISCONNECT' : 'SCAN FOR RADIO'}
+            {scanning ? 'SCANNING...' : connecting ? 'CONNECTING...' : radioConnected ? 'DISCONNECT' : 'SCAN FOR RADIO'}
           </Text>
         </TouchableOpacity>
 

@@ -260,82 +260,90 @@ function useBLE() {
       addLog('Already scanning/connecting — ignoring');
       return;
     }
+    
     isConnectingRef.current = true;
 
-    const hasPermission = await requestPermissions();
-    if (!hasPermission) {
-      addLog('Bluetooth permissions denied');
-      resetConnectingGuard();
-      return;
-    }
-
-    // Wait for BLE to be powered on
-    const bleState = await managerRef.current.state();
-    if (bleState !== State.PoweredOn) {
-      addLog('Bluetooth is off — please enable it');
-      resetConnectingGuard();
-      return;
-    }
-
-    setState(prev => ({ ...prev, scanning: true, radioDetected: false, radioConnected: false }));
-    addLog('Scanning for TetraRadio...');
-
-    // Auto-stop scan after 15 seconds if nothing found
-    scanTimerRef.current = setTimeout(() => {
-      managerRef.current?.stopDeviceScan();
-      setState(prev => ({ ...prev, scanning: false }));
-      addLog('Scan timeout — TetraRadio not found');
-      resetConnectingGuard();
-    }, 15000);
-
-    managerRef.current.startDeviceScan(
-      [SERVICE_UUID],   // (Should match PhonePeripheral.ino PHONE_SERVICE_UUIxqD)
-      null,
-      async (error, device) => {
-        if (error) {
-          addLog(`Scan error: ${error.message}`);
-          setState(prev => ({ ...prev, scanning: false }));
-          clearTimeout(scanTimerRef.current);
-          resetConnectingGuard();
-          return;
-        }
-
-        // Anything delivered here already matched the UUID filter above —
-        // no need to check device.name.
-        managerRef.current.stopDeviceScan();
-        clearTimeout(scanTimerRef.current);
-        setState(prev => ({ ...prev, radioDetected: true, scanning: false, connecting: true }));
-        addLog(`Found ${device.name || DEVICE_NAME}! Connecting...`);
-
-        try {
-          await new Promise(resolve => setTimeout(resolve, 300)); //TODO: Check if you we need this debug thing
-          const connected = await device.connect();
-          await connected.discoverAllServicesAndCharacteristics();
-          deviceRef.current = connected;
-          setState(prev => ({ ...prev, radioConnected: true, connecting: false}));
-          addLog(`Connected to ${DEVICE_NAME}`);
-          subscribeToDevice(connected);
-          resetConnectingGuard();
-        } catch (e) { 
-          addLog(`Connection failed: ${e.message}`);
-          addLog(`  errorCode=${e.errorCode} reason=${e.reason}`);
-          addLog(`  androidErrorCode=${e.androidErrorCode} androidCode=${e.attErrorCode}`);
-          addLog(`  iosErrorCode=${e.iosErrorCode}`);
-          console.log('Full BLE error:', JSON.stringify(e, null, 2));
-
-          // Release the native GATT client even though connect failed —
-          // otherwise it can leak and exhaust Android's GATT client slots.
-          //TODO: Check if we need this debug thing
-          try {
-            await device.cancelConnection();
-          } catch (_) {
-            // already gone, fine
-          }
-          setState(prev => ({ ...prev, radioDetected: false, connecting: false}));
-          resetConnectingGuard();
-        }
+    try{
+      const hasPermission = await requestPermissions();
+      if (!hasPermission) {
+        addLog('Bluetooth permissions denied');
+        resetConnectingGuard();
+        return;
       }
-    );
+
+      // Wait for BLE to be powered on
+      const bleState = await managerRef.current.state();
+      if (bleState !== State.PoweredOn) {
+        addLog('Bluetooth is off — please enable it');
+        resetConnectingGuard();
+        return;
+      }
+
+      setState(prev => ({ ...prev, scanning: true, radioDetected: false, radioConnected: false }));
+      addLog('Scanning for TetraRadio...');
+
+      // Auto-stop scan after 15 seconds if nothing found
+      scanTimerRef.current = setTimeout(() => {
+        managerRef.current?.stopDeviceScan();
+        setState(prev => ({ ...prev, scanning: false }));
+        addLog('Scan timeout — TetraRadio not found');
+        resetConnectingGuard();
+      }, 15000);
+
+      managerRef.current.startDeviceScan(
+        [SERVICE_UUID],   // (Should match PhonePeripheral.ino PHONE_SERVICE_UUIxqD)
+        null,
+        async (error, device) => {
+          if (error) {
+            addLog(`Scan error: ${error.message}`);
+            setState(prev => ({ ...prev, scanning: false }));
+            clearTimeout(scanTimerRef.current);
+            resetConnectingGuard();
+            return;
+          }
+
+          // Anything delivered here already matched the UUID filter above —
+          // no need to check device.name.
+          managerRef.current.stopDeviceScan();
+          clearTimeout(scanTimerRef.current);
+          setState(prev => ({ ...prev, radioDetected: true, scanning: false, connecting: true }));
+          addLog(`Found ${device.name || DEVICE_NAME}! Connecting...`);
+
+          try {
+            await new Promise(resolve => setTimeout(resolve, 300)); //TODO: Check if you we need this debug thing
+            const connected = await device.connect();
+            await connected.discoverAllServicesAndCharacteristics();
+            deviceRef.current = connected;
+            setState(prev => ({ ...prev, radioConnected: true, connecting: false}));
+            addLog(`Connected to ${DEVICE_NAME}`);
+            subscribeToDevice(connected);
+            resetConnectingGuard();
+          } catch (e) { 
+            addLog(`Connection failed: ${e.message}`);
+            addLog(`  errorCode=${e.errorCode} reason=${e.reason}`);
+            addLog(`  androidErrorCode=${e.androidErrorCode} androidCode=${e.attErrorCode}`);
+            addLog(`  iosErrorCode=${e.iosErrorCode}`);
+            console.log('Full BLE error:', JSON.stringify(e, null, 2));
+
+            // Release the native GATT client even though connect failed —
+            // otherwise it can leak and exhaust Android's GATT client slots.
+            //TODO: Check if we need this debug thing
+            try {
+              await device.cancelConnection();
+            } catch (_) {
+              // already gone, fine
+            }
+            setState(prev => ({ ...prev, radioDetected: false, connecting: false}));
+            resetConnectingGuard();
+          }
+        }
+      );
+    }
+    catch(e){
+      addLog(`Scan setup failed: ${e.message}`);
+    } finally {
+      resetConnectingGuard();
+    }
   }, [requestPermissions, subscribeToDevice, addLog]);
 
   const disconnect = useCallback(async () => {

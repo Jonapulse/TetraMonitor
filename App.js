@@ -26,6 +26,10 @@ const DEVICE_NAME       = 'TetraRadio';
 
 const ThemeContext = React.createContext(null);
 
+//Initialize BleManager at module level to avoid messy on-dismount destroys
+const bleManager = new BleManager();
+bleManager.setLogLevel(LogLevel.Verbose);
+
 // ─── Real BLE Hook ────────────────────────────────────────────────────────────
 function useBLE() {
   const [state, setState] = useState({
@@ -46,7 +50,7 @@ function useBLE() {
     rawLog: [],
   });
 
-  const managerRef   = useRef(null);
+  const managerRef   = useRef(bleManager);
   const deviceRef    = useRef(null);
   const scanTimerRef = useRef(null);
   const lastDataTime = useRef(null);
@@ -56,15 +60,6 @@ function useBLE() {
 
   const prevDirection0 = useRef(0);
   const prevDirection1 = useRef(0);
-
-  // Initialise BLE manager once
-  useEffect(() => {
-    managerRef.current = new BleManager();
-    managerRef.current.setLogLevel(LogLevel.Verbose);
-    return () => {
-      managerRef.current?.destroy();
-    };
-  }, []);
 
   const addLog = useCallback((msg) => {
     setState(prev => ({

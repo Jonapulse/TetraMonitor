@@ -13,16 +13,89 @@ import {
 } from 'react-native';
 
 import { Buffer } from 'buffer';
+import * as FileSystem from 'expo-file-system/legacy'; // SDK 54 moved getInfoAsync/readAsStringAsync here
 
 import { BleManager, LogLevel, State } from 'react-native-ble-plx';
 
-// ─── BLE UUIDs (must match OTATest.ino) ──────────────────────────────────────
-const SERVICE_UUID      = '12345678-1234-1234-1234-123456789abc';
-const SENSOR_DATA_UUID  = '12345678-1234-1234-1234-123456789abd';
-const BATTERY_DATA_UUID = '12345678-1234-1234-1234-123456789abe';
-const COMMAND_UUID      = '12345678-1234-1234-1234-123456789abf';
-const CONFIG_UUID       = '12345678-1234-1234-1234-123456789ac0';
+// ─── BLE UUIDs (must match PhonePeripheral.ino) ──────────────────────────────
+const SERVICE_UUID      = '4eeccffa-0893-48bf-bc8f-cd8fb2582adf';
+const SENSOR_DATA_UUID  = '3cdac197-9d0d-45cf-a20a-59ef05ada9e2';
+const BATTERY_DATA_UUID = '9a411fd3-d1fc-4d4e-804c-63d6d6a84124';
+const COMMAND_UUID      = '4c9c9fb1-98e2-48cf-95c0-acf012c8bbf5';
+const CONFIG_UUID       = '45d76eff-37fe-484b-aeea-b99581d35375';
 const DEVICE_NAME       = 'TetraRadio';
+
+// TEMPORARY: fixed path for manually pushing a real firmware.bin onto the
+// device for OTA bench testing (via `adb push` into app-private storage).
+// Not part of the real update flow — remove once manifest/download exists.
+const TEST_FIRMWARE_PATH = FileSystem.documentDirectory + 'firmwareComm.bin';
+
+// ─── BLE OTA UUIDs (must match OTAService.ino) ───────────────────────────────
+// NOTE: placeholder values — swap in the real generated UUIDs once finalized
+// in OTAService.ino, and keep both sides in sync.
+const OTA_SERVICE_UUID  = 'c076ed50-9e91-4566-9023-3cb1b9173244';
+const OTA_CONTROL_UUID  = 'ed3c98b9-0a71-45e0-9b14-b89d3316549d';
+const OTA_DATA_UUID     = 'ee191e3a-95c6-4bf1-92b8-1980c9e7b8e9';
+const OTA_STATUS_UUID   = '5c8b02e7-5520-468f-bcba-fcc5093da1c9';
+
+// Must match OTA_CHUNK_PAYLOAD_MAX in OTAService.ino. This assumes an ATT
+// MTU of 185 gets negotiated before transfer starts (185 - 3 ATT overhead
+// - 2 seq header = 180 usable payload bytes).
+const OTA_CHUNK_PAYLOAD_MAX = 180;
+const OTA_TARGET_MTU        = 185;
+const OTA_CHUNK_DELAY_MS    = 15; // fixed-delay pacing between chunk writes
+
+// Status codes sent by the radio over OTA_STATUS_UUID — must match the
+// OTAStatusCode enum in OTAService.ino.
+const OTA_STATUS = {
+  READY:     0x01,
+  PROGRESS:  0x02,
+  DONE:      0x03,
+  ERR_SIZE:  0xE0,
+  ERR_SEQ:   0xE1,
+  ERR_CRC:   0xE2,
+  ERR_WRITE: 0xE3,
+  ERR_STATE: 0xE4,
+  ERR_BEGIN: 0xE5,
+};
+
+const OTA_ERROR_MESSAGES = {
+  [OTA_STATUS.ERR_SIZE]:  'Firmware too large for OTA partition',
+  [OTA_STATUS.ERR_SEQ]:   'Chunk sequence error — dropped or out-of-order packet',
+  [OTA_STATUS.ERR_CRC]:   'CRC mismatch — transferred image is corrupt',
+  [OTA_STATUS.ERR_WRITE]: 'Flash write failed on radio',
+  [OTA_STATUS.ERR_STATE]: 'Radio rejected command for current OTA state',
+  [OTA_STATUS.ERR_BEGIN]: 'Radio failed to begin update (Update.begin() failed)',
+};
+
+// ─── CRC32 (standard CRC-32/IEEE 802.3 — matches ESP-IDF's crc32_le) ─────────
+// Table-based, chainable: crc32(bufN, crc32(bufN-1, ..., crc32(buf1, 0)))
+// equals crc32(concat(buf1..bufN), 0). We only need the full-buffer form
+// here since the firmware chains chunk-wise but the result is identical
+// regardless of how the data was split.
+let _crc32Table = null;
+function getCRC32Table() {
+  if (_crc32Table) return _crc32Table;
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  _crc32Table = table;
+  return table;
+}
+
+function crc32(buffer, seed = 0) {
+  const table = getCRC32Table();
+  let crc = (seed ^ 0xFFFFFFFF) >>> 0;
+  for (let i = 0; i < buffer.length; i++) {
+    crc = (table[(crc ^ buffer[i]) & 0xFF] ^ (crc >>> 8)) >>> 0;
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
 
 const ThemeContext = React.createContext(null);
 
@@ -48,15 +121,21 @@ function useBLE() {
     log: ['Ready. Press SCAN to find TetraRadio.'],
     serialLog: ['Waiting for serial output from radio controller...'],
     rawLog: [],
+    otaStatus: 'idle',       // 'idle' | 'sending' | 'verifying' | 'done' | 'error'
+    otaProgress: 0,          // 0..1
+    otaBytesSent: 0,
+    otaBytesTotal: 0,
+    otaError: null,
   });
 
   const managerRef   = useRef(bleManager);
   const deviceRef    = useRef(null);
   const scanTimerRef = useRef(null);
   const lastDataTime = useRef(null);
-  const subscriptionsRef = useRef({ sensorSub: null, configSub: null, disconnectSub: null, battInterval: null });
+  const subscriptionsRef = useRef({ sensorSub: null, configSub: null, disconnectSub: null, battInterval: null, otaSub: null });
   const disconnectFallbackRef = useRef(null);
   const isConnectingRef = useRef(false);
+  const otaAbortRef = useRef(false);
 
   const prevDirection0 = useRef(0);
   const prevDirection1 = useRef(0);
@@ -79,10 +158,11 @@ function useBLE() {
     subscriptionsRef.current.sensorSub?.remove();
     subscriptionsRef.current.configSub?.remove();
     subscriptionsRef.current.disconnectSub?.remove();
+    subscriptionsRef.current.otaSub?.remove();
     if (subscriptionsRef.current.battInterval) {
       clearInterval(subscriptionsRef.current.battInterval);
     }
-    subscriptionsRef.current = { sensorSub: null, configSub: null, disconnectSub: null, battInterval: null };
+    subscriptionsRef.current = { sensorSub: null, configSub: null, disconnectSub: null, battInterval: null, otaSub: null };
   }, []);
 
   const addSerialLog = useCallback((msg) => {
@@ -286,7 +366,7 @@ function useBLE() {
       }, 15000);
 
       managerRef.current.startDeviceScan(
-        [SERVICE_UUID],   // (Should match PhonePeripheral.ino PHONE_SERVICE_UUIxqD)
+        [SERVICE_UUID],   // matches PhonePeripheral.ino PHONE_SERVICE_UUID
         null,
         async (error, device) => {
           if (error) {
@@ -456,6 +536,166 @@ function useBLE() {
     else            sendCommand(inverted ? 'h' : 'g');
   }, [sendCommand]);
 
+  // ─── BLE OTA firmware transfer ────────────────────────────────────────────
+  // firmwareBytes must be a Buffer (or Buffer-compatible Uint8Array) of the
+  // full .bin image. Manifest fetch / download / caching happens upstream
+  // of this function — this only handles the wire protocol against
+  // OTAService.ino once you already have the bytes in hand.
+  const sendFirmwareUpdate = useCallback(async (firmwareBytes) => {
+    if (!deviceRef.current || !state.radioConnected) {
+      addLog('OTA: not connected to radio');
+      return { success: false, error: 'Not connected' };
+    }
+
+    const device = deviceRef.current;
+    const totalSize = firmwareBytes.length;
+    const expectedCRC = crc32(firmwareBytes, 0);
+
+    otaAbortRef.current = false;
+    setState(prev => ({
+      ...prev, otaStatus: 'sending', otaProgress: 0, otaError: null,
+      otaBytesTotal: totalSize, otaBytesSent: 0,
+    }));
+    addLog(`OTA: starting update, ${totalSize} bytes, crc=0x${expectedCRC.toString(16)}`);
+
+    // Only one status response is ever "pending" at a time (READY after
+    // START, DONE after END) — PROGRESS notifications flow through the
+    // same subscription but don't resolve/reject anything. asyncError is
+    // separate: it catches an error code that arrives *outside* either
+    // pending window (e.g. a sequence/write error firmware reports mid-
+    // transfer, while the chunk loop is just writing and not awaiting
+    // anything) so it isn't silently dropped — the chunk loop below checks
+    // it every iteration.
+    let pendingResolve = null;
+    let pendingReject = null;
+    let asyncError = null;
+    const waitForStatus = () => new Promise((resolve, reject) => {
+      pendingResolve = resolve;
+      pendingReject = reject;
+    });
+
+    const otaSub = device.monitorCharacteristicForService(
+      OTA_SERVICE_UUID,
+      OTA_STATUS_UUID,
+      (error, characteristic) => {
+        if (error) {
+          asyncError = new Error(`OTA status error: ${error.message}`);
+          pendingReject?.(asyncError);
+          return;
+        }
+        if (!characteristic?.value) return;
+        const bytes = Buffer.from(characteristic.value, 'base64');
+        const code = bytes[0];
+
+        if (code === OTA_STATUS.PROGRESS) {
+          const bytesWritten = bytes.readUInt32LE(1);
+          setState(prev => ({
+            ...prev, otaBytesSent: bytesWritten,
+            otaProgress: totalSize > 0 ? bytesWritten / totalSize : 0,
+          }));
+          return;
+        }
+
+        if (code === OTA_STATUS.READY || code === OTA_STATUS.DONE) {
+          pendingResolve?.(code);
+        } else {
+          const msg = OTA_ERROR_MESSAGES[code] || `Unknown OTA status (0x${code.toString(16)})`;
+          asyncError = new Error(msg);
+          pendingReject?.(asyncError);
+        }
+      }
+    );
+    subscriptionsRef.current.otaSub = otaSub;
+
+    const cleanupOTA = () => {
+      subscriptionsRef.current.otaSub?.remove();
+      subscriptionsRef.current.otaSub = null;
+    };
+
+    try {
+      // Request a larger ATT MTU so chunk writes can carry OTA_CHUNK_PAYLOAD_MAX
+      // bytes. Android-only in ble-plx — iOS negotiates automatically and
+      // typically lands at 185+ on modern devices, but that's an assumption
+      // worth confirming on your actual test hardware, not guaranteed here.
+      if (Platform.OS === 'android') {
+        const mtuDevice = await device.requestMTU(OTA_TARGET_MTU);
+        if (mtuDevice.mtu < OTA_TARGET_MTU) {
+          throw new Error(`MTU negotiation gave ${mtuDevice.mtu}, need at least ${OTA_TARGET_MTU}`);
+        }
+        addLog(`OTA: negotiated MTU ${mtuDevice.mtu}`);
+      }
+
+      // ---- START: 'S' + size(4 LE) + crc32(4 LE) ----
+      const startPayload = Buffer.alloc(9);
+      startPayload.write('S', 0, 'ascii');
+      startPayload.writeUInt32LE(totalSize, 1);
+      startPayload.writeUInt32LE(expectedCRC, 5);
+
+      const readyPromise = waitForStatus();
+      await device.writeCharacteristicWithResponseForService(
+        OTA_SERVICE_UUID, OTA_CONTROL_UUID, startPayload.toString('base64')
+      );
+      await readyPromise; // rejects if the radio replies with an error code instead of READY
+      addLog('OTA: radio ready, sending firmware...');
+
+      // ---- DATA: seq(2 LE) + chunk payload, fixed-delay paced ----
+      let seq = 0;
+      let offset = 0;
+      while (offset < totalSize) {
+        if (otaAbortRef.current) throw new Error('OTA cancelled');
+        if (asyncError) throw asyncError;
+
+        const end = Math.min(offset + OTA_CHUNK_PAYLOAD_MAX, totalSize);
+        const framed = Buffer.alloc(2 + (end - offset));
+        framed.writeUInt16LE(seq & 0xFFFF, 0);
+        firmwareBytes.copy(framed, 2, offset, end);
+
+        // WRITE_NR has no per-write ack, so throughput is throttled here
+        // rather than waiting on a response per chunk.
+        await device.writeCharacteristicWithoutResponseForService(
+          OTA_SERVICE_UUID, OTA_DATA_UUID, framed.toString('base64')
+        );
+        await new Promise(r => setTimeout(r, OTA_CHUNK_DELAY_MS));
+
+        seq++;
+        offset = end;
+      }
+
+      // ---- END: verify + apply ----
+      if (asyncError) throw asyncError;
+      setState(prev => ({ ...prev, otaStatus: 'verifying' }));
+      addLog('OTA: all chunks sent, verifying...');
+
+      const donePromise = waitForStatus();
+      await device.writeCharacteristicWithResponseForService(
+        OTA_SERVICE_UUID, OTA_CONTROL_UUID, Buffer.from(['E'.charCodeAt(0)]).toString('base64')
+      );
+      await donePromise; // rejects on ERR_CRC / ERR_WRITE
+
+      setState(prev => ({ ...prev, otaStatus: 'done', otaProgress: 1 }));
+      addLog('OTA: update applied, radio is rebooting');
+      cleanupOTA();
+      return { success: true };
+
+    } catch (e) {
+      cleanupOTA();
+      setState(prev => ({ ...prev, otaStatus: 'error', otaError: e.message }));
+      addLog(`OTA failed: ${e.message}`);
+      // Best-effort ABORT so the radio doesn't sit stuck mid-transfer waiting
+      // for chunks that are never coming.
+      try {
+        await device.writeCharacteristicWithResponseForService(
+          OTA_SERVICE_UUID, OTA_CONTROL_UUID, Buffer.from(['A'.charCodeAt(0)]).toString('base64')
+        );
+      } catch (_) { /* best effort — radio may already be gone */ }
+      return { success: false, error: e.message };
+    }
+  }, [state.radioConnected, addLog]);
+
+  const cancelFirmwareUpdate = useCallback(() => {
+    otaAbortRef.current = true;
+  }, []);
+
   // Poll every second while radio is connected. If sensor data has been
   // silent for >3s, flag sensorDropped. Clears automatically when data resumes.
   // Pure observer — never sends commands or interferes with firmware reconnect.
@@ -471,7 +711,10 @@ function useBLE() {
     return () => clearInterval(interval);
   }, []);
 
-  return { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert };
+  return {
+    state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert,
+    sendFirmwareUpdate, cancelFirmwareUpdate, addLog,
+  };
 }
 
 
@@ -742,11 +985,13 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert } = useBLE();
+  const { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert,
+          sendFirmwareUpdate, cancelFirmwareUpdate, addLog } = useBLE();
   const { radioDetected, radioConnected, scanning, connecting, sensorDropped,
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
-          battLevels, log, serialLog, rawLog } = state;
+          battLevels, log, serialLog, rawLog,
+          otaStatus, otaProgress, otaBytesSent, otaBytesTotal, otaError } = state;
 
   const [showLog, setShowLog] = useState(false);
   const [logStream, setLogStream] = useState('events'); // 'events' | 'serial'
@@ -846,6 +1091,48 @@ export default function App() {
             <TouchableOpacity style={styles.calibrateBtn} onPress={() => sendCommand('5')}>
               <Text style={styles.calibrateBtnText}>⟳  RECALIBRATE</Text>
             </TouchableOpacity>
+
+            {/* TEMPORARY: exercises the full OTA path against a REAL firmware
+                image manually pushed to TEST_FIRMWARE_PATH via adb, so a
+                write+reboot cycle can be validated before the manifest/
+                download flow exists. Remove once real update UI replaces it. */}
+            <TouchableOpacity
+              style={[styles.calibrateBtn, { marginTop: 8 }]}
+              onPress={async () => {
+                try {
+                  const info = await FileSystem.getInfoAsync(TEST_FIRMWARE_PATH);
+                  if (!info.exists) {
+                    addLog(`OTA: no firmware.bin found at ${TEST_FIRMWARE_PATH} — push it via adb first`);
+                    return;
+                  }
+                  const base64 = await FileSystem.readAsStringAsync(TEST_FIRMWARE_PATH, {
+                    encoding: FileSystem.EncodingType.Base64,
+                  });
+                  const firmwareBuffer = Buffer.from(base64, 'base64');
+                  addLog(`OTA: read firmware.bin (${firmwareBuffer.length} bytes) from device storage`);
+                  sendFirmwareUpdate(firmwareBuffer);
+                } catch (e) {
+                  addLog(`OTA: failed to read firmware.bin: ${e.message}`);
+                }
+              }}
+              disabled={otaStatus === 'sending' || otaStatus === 'verifying'}
+            >
+              <Text style={styles.calibrateBtnText}>
+                {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
+                  : otaStatus === 'verifying' ? '⇪ VERIFYING...'
+                  : '⇪ TEST OTA TRANSFER (firmware.bin)'}
+              </Text>
+            </TouchableOpacity>
+            {otaStatus === 'error' && (
+              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                OTA error: {otaError}
+              </Text>
+            )}
+            {otaStatus === 'done' && (
+              <Text style={{ color: colors.accent, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                Transfer completed — radio should be rebooting now
+              </Text>
+            )}
           </>
         )}
 

@@ -37,13 +37,11 @@ const OTA_SERVICE_UUID  = 'c076ed50-9e91-4566-9023-3cb1b9173244';
 const OTA_CONTROL_UUID  = 'ed3c98b9-0a71-45e0-9b14-b89d3316549d';
 const OTA_DATA_UUID     = 'ee191e3a-95c6-4bf1-92b8-1980c9e7b8e9';
 const OTA_STATUS_UUID   = '5c8b02e7-5520-468f-bcba-fcc5093da1c9';
+const OTA_VERSION_UUID  = 'c82f2a3c-f48c-4cfa-b447-0277467898e4';
 
-// Must match OTA_CHUNK_PAYLOAD_MAX in OTAService.ino. This assumes an ATT
-// MTU of 185 gets negotiated before transfer starts (185 - 3 ATT overhead
-// - 2 seq header = 180 usable payload bytes).
 const OTA_CHUNK_PAYLOAD_MAX = 244;
-const OTA_TARGET_MTU        = 249;
-const OTA_CHUNK_DELAY_MS    = 5; // fixed-delay pacing between chunk writes
+const OTA_TARGET_MTU        = 249; 
+const OTA_CHUNK_DELAY_MS    = 5;  
 
 // Status codes sent by the radio over OTA_STATUS_UUID — must match the
 // OTAStatusCode enum in OTAService.ino.
@@ -97,6 +95,23 @@ function crc32(buffer, seed = 0) {
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
 
+// ─── Semver comparison ────────────────────────────────────────────────────
+// Compares two "MAJOR.MINOR.PATCH" strings. Returns 1 if a > b, -1 if a < b,
+// 0 if equal. Missing/non-numeric segments treated as 0. Plain lexicographic
+// comparison breaks on "1.10.0" vs "1.9.0" — this compares numerically per
+// segment instead. Will be used to decide whether a manifest-advertised
+// version is newer than the firmware's currently reported version.
+function compareSemver(a, b) {
+  const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i] || 0;
+    const nb = pb[i] || 0;
+    if (na !== nb) return na > nb ? 1 : -1;
+  }
+  return 0;
+}
+
 const ThemeContext = React.createContext(null);
 
 //Initialize BleManager at module level to avoid messy on-dismount destroys
@@ -126,6 +141,9 @@ function useBLE() {
     otaBytesSent: 0,
     otaBytesTotal: 0,
     otaError: null,
+    firmwareVersion: null,   // read from the radio on connect; used for manifest
+                             // compare and to verify a post-OTA reboot landed
+                             // on the expected version
   });
 
   const managerRef   = useRef(bleManager);
@@ -214,6 +232,20 @@ function useBLE() {
   }, []);
 
   // Subscribe to sensor data notifications and battery reads
+  // Reusable so post-OTA verification (reading the version again after a
+  // reboot to confirm it actually changed) can share this instead of
+  // duplicating the read+decode logic.
+  const readFirmwareVersion = useCallback(async (device) => {
+    try {
+      const char = await device.readCharacteristicForService(OTA_SERVICE_UUID, OTA_VERSION_UUID);
+      if (!char?.value) return null;
+      return Buffer.from(char.value, 'base64').toString('utf8');
+    } catch (e) {
+      addLog(`Failed to read firmware version: ${e.message}`);
+      return null;
+    }
+  }, [addLog]);
+
   const subscribeToDevice = useCallback(async (device) => {
     // Defensive: if subscribeToDevice were ever called again while a previous
     // connection's listeners are still live, this prevents them from stacking.
@@ -299,12 +331,20 @@ function useBLE() {
           direction0: 0, val0: 0, val1: 0,
           direction1: 0, val2: 0, val3: 0,
           battLevels: [0, 0, 0, 0],
+          firmwareVersion: null,
         }));
         addLog('TetraRadio disconnected');
       });
       subscriptionsRef.current.disconnectSub = disconnectSub;
 
       addLog('Subscribed to sensor data');
+
+      readFirmwareVersion(device).then(version => {
+        if (version) {
+          addLog(`Firmware version: ${version}`);
+          setState(prev => ({ ...prev, firmwareVersion: version }));
+        }
+      });
 
       // Monitor config characteristic — firmware sends one packet on phone connect
       // with current settings so app display matches firmware state.
@@ -328,7 +368,7 @@ function useBLE() {
     } catch (e) {
       addLog(`Subscribe error: ${e.message}`);
     }
-  }, [addLog, cleanupSubscriptions, addSerialLog, addRawLog]);
+  }, [addLog, cleanupSubscriptions, addSerialLog, addRawLog, readFirmwareVersion]);
 
   const startScan = useCallback(async () => {
     if (isConnectingRef.current) {
@@ -613,17 +653,22 @@ function useBLE() {
     };
 
     try {
-      // Request a larger ATT MTU so chunk writes can carry OTA_CHUNK_PAYLOAD_MAX
-      // bytes. Android-only in ble-plx — iOS negotiates automatically and
-      // typically lands at 185+ on modern devices, but that's an assumption
-      // worth confirming on your actual test hardware, not guaranteed here.
+      // Request the largest ATT MTU the platform/radio will grant, then size
+      // chunks off whatever actually gets negotiated — MTU can only go up
+      // once set for a connection, never down, so a lower-than-requested
+      // result here is fine, not an error; we just use less headroom per
+      // chunk. requestMTU is Android-only in ble-plx; iOS negotiates
+      // automatically and device.mtu reflects the outcome once connected
+      // (not independently verified against real iOS hardware here).
+      let negotiatedMtu = device.mtu || 23;
       if (Platform.OS === 'android') {
         const mtuDevice = await device.requestMTU(OTA_TARGET_MTU);
-        if (mtuDevice.mtu < OTA_TARGET_MTU) {
-          throw new Error(`MTU negotiation gave ${mtuDevice.mtu}, need at least ${OTA_TARGET_MTU}`);
-        }
-        addLog(`OTA: negotiated MTU ${mtuDevice.mtu}`);
+        negotiatedMtu = mtuDevice.mtu;
+      } else {
+        negotiatedMtu = device.mtu;
       }
+      const chunkPayload = Math.max(20, Math.min(negotiatedMtu - 3 - 2, OTA_CHUNK_PAYLOAD_MAX));
+      addLog(`OTA: MTU=${negotiatedMtu}, using ${chunkPayload}-byte chunks`);
 
       // ---- START: 'S' + size(4 LE) + crc32(4 LE) ----
       const startPayload = Buffer.alloc(9);
@@ -645,7 +690,7 @@ function useBLE() {
         if (otaAbortRef.current) throw new Error('OTA cancelled');
         if (asyncError) throw asyncError;
 
-        const end = Math.min(offset + OTA_CHUNK_PAYLOAD_MAX, totalSize);
+        const end = Math.min(offset + chunkPayload, totalSize);
         const framed = Buffer.alloc(2 + (end - offset));
         framed.writeUInt16LE(seq & 0xFFFF, 0);
         firmwareBytes.copy(framed, 2, offset, end);
@@ -713,7 +758,7 @@ function useBLE() {
 
   return {
     state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert,
-    sendFirmwareUpdate, cancelFirmwareUpdate, addLog,
+    sendFirmwareUpdate, cancelFirmwareUpdate, addLog, readFirmwareVersion,
   };
 }
 
@@ -991,7 +1036,8 @@ export default function App() {
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
           battLevels, log, serialLog, rawLog,
-          otaStatus, otaProgress, otaBytesSent, otaBytesTotal, otaError } = state;
+          otaStatus, otaProgress, otaBytesSent, otaBytesTotal, otaError,
+          firmwareVersion } = state;
 
   const [showLog, setShowLog] = useState(false);
   const [logStream, setLogStream] = useState('events'); // 'events' | 'serial'
@@ -1025,6 +1071,11 @@ export default function App() {
 
         {/* Connection Status */}
         <StatusBadge detected={radioDetected} connected={radioConnected} scanning={scanning} sensorDropped={sensorDropped} />
+        {radioConnected && firmwareVersion && (
+          <Text style={{ color: colors.textSecondary ?? colors.headerSub, fontSize: 12, textAlign: 'center', marginTop: -8, marginBottom: 8 }}>
+            Firmware v{firmwareVersion}
+          </Text>
+        )}
 
         {/* Scan / Disconnect Button */}
         <TouchableOpacity

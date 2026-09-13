@@ -28,7 +28,7 @@ const DEVICE_NAME       = 'TetraRadio';
 // TEMPORARY: fixed path for manually pushing a real firmware.bin onto the
 // device for OTA bench testing (via `adb push` into app-private storage).
 // Not part of the real update flow — remove once manifest/download exists.
-const TEST_FIRMWARE_PATH = FileSystem.documentDirectory + 'firmwareComm.bin';
+const TEST_FIRMWARE_PATH = FileSystem.documentDirectory + 'firmware.bin';
 
 // ─── BLE OTA UUIDs (must match OTAService.ino) ───────────────────────────────
 // NOTE: placeholder values — swap in the real generated UUIDs once finalized
@@ -41,9 +41,9 @@ const OTA_STATUS_UUID   = '5c8b02e7-5520-468f-bcba-fcc5093da1c9';
 // Must match OTA_CHUNK_PAYLOAD_MAX in OTAService.ino. This assumes an ATT
 // MTU of 185 gets negotiated before transfer starts (185 - 3 ATT overhead
 // - 2 seq header = 180 usable payload bytes).
-const OTA_CHUNK_PAYLOAD_MAX = 180;
-const OTA_TARGET_MTU        = 185;
-const OTA_CHUNK_DELAY_MS    = 15; // fixed-delay pacing between chunk writes
+const OTA_CHUNK_PAYLOAD_MAX = 244;
+const OTA_TARGET_MTU        = 249;
+const OTA_CHUNK_DELAY_MS    = 5; // fixed-delay pacing between chunk writes
 
 // Status codes sent by the radio over OTA_STATUS_UUID — must match the
 // OTAStatusCode enum in OTAService.ino.

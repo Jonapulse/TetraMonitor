@@ -850,8 +850,8 @@ function useBLE() {
   }, [addLog]);
 
   // Downloads whatever checkForUpdate last found, verifies the byte count
-  // against what GitHub reported, then hands the
-  // buffer to the same transfer path the manual test button uses.
+  // against what GitHub reported, then hands the  buffer to the same 
+  // transfer path the manual test button uses.
   const downloadAndInstallUpdate = useCallback(async () => {
     const { downloadUrl, size, latestVersion } = state.updateCheck;
     if (!downloadUrl) {

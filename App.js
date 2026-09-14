@@ -30,8 +30,15 @@ const DEVICE_NAME       = 'TetraRadio';
 // Not part of the real update flow — remove once manifest/download exists.
 const TEST_FIRMWARE_PATH = FileSystem.documentDirectory + 'firmware.bin';
 
+// ─── GitHub Releases manifest source ──────────────────────────────────────
+// Public repo — no auth needed. Convention: release tag is "vX.Y.Z" matching
+// FIRMWARE_VERSION (v-prefix stripped before compare); release has exactly
+// one asset named "firmware.bin".
+const GITHUB_OWNER = 'Jonapulse'; 
+const GITHUB_REPO  = 'TetraskiController';          
+const GITHUB_RELEASES_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
+
 // ─── BLE OTA UUIDs (must match OTAService.ino) ───────────────────────────────
-// NOTE: placeholder values — swap in the real generated UUIDs once finalized
 // in OTAService.ino, and keep both sides in sync.
 const OTA_SERVICE_UUID  = 'c076ed50-9e91-4566-9023-3cb1b9173244';
 const OTA_CONTROL_UUID  = 'ed3c98b9-0a71-45e0-9b14-b89d3316549d';
@@ -40,8 +47,8 @@ const OTA_STATUS_UUID   = '5c8b02e7-5520-468f-bcba-fcc5093da1c9';
 const OTA_VERSION_UUID  = 'c82f2a3c-f48c-4cfa-b447-0277467898e4';
 
 const OTA_CHUNK_PAYLOAD_MAX = 244;
-const OTA_TARGET_MTU        = 249; 
-const OTA_CHUNK_DELAY_MS    = 5;  
+const OTA_TARGET_MTU        = 249;
+const OTA_CHUNK_DELAY_MS    = 5;
 
 // Status codes sent by the radio over OTA_STATUS_UUID — must match the
 // OTAStatusCode enum in OTAService.ino.
@@ -144,6 +151,12 @@ function useBLE() {
     firmwareVersion: null,   // read from the radio on connect; used for manifest
                              // compare and to verify a post-OTA reboot landed
                              // on the expected version
+    updateCheck: { status: 'idle', latestVersion: null, downloadUrl: null, size: 0, error: null },
+                             // status: 'idle' | 'checking' | 'checked' | 'error'
+    postUpdateStatus: 'idle',
+                             // 'idle' | 'reconnecting' | 'verified' | 'mismatch' | 'failed'
+                             // — tracks reconnecting after an OTA reboot and
+                             // confirming the new version actually took.
   });
 
   const managerRef   = useRef(bleManager);
@@ -154,6 +167,9 @@ function useBLE() {
   const disconnectFallbackRef = useRef(null);
   const isConnectingRef = useRef(false);
   const otaAbortRef = useRef(false);
+  const otaStatusRef = useRef('idle');
+  const pendingVerifyVersionRef = useRef(null);
+  const postOtaFailTimeoutRef = useRef(null);
 
   const prevDirection0 = useRef(0);
   const prevDirection1 = useRef(0);
@@ -315,7 +331,8 @@ function useBLE() {
       subscriptionsRef.current.battInterval = battInterval;
 
       // Clean up all listeners/intervals when device disconnects — whether
-      // that's from the user tapping disconnect or an unexpected drop.
+      // that's from the user tapping disconnect, an unexpected drop, or (see
+      // below) the radio rebooting into new firmware after a completed OTA.
       const disconnectSub = device.onDisconnected(() => {
         clearTimeout(disconnectFallbackRef.current);
         cleanupSubscriptions();
@@ -323,6 +340,9 @@ function useBLE() {
         lastDataTime.current = null;
         prevDirection0.current = 0;
         prevDirection1.current = 0;
+
+        const followsCompletedOta = otaStatusRef.current === 'done';
+
         setState(prev => ({
           ...prev,
           radioDetected: false,
@@ -332,17 +352,43 @@ function useBLE() {
           direction1: 0, val2: 0, val3: 0,
           battLevels: [0, 0, 0, 0],
           firmwareVersion: null,
+          postUpdateStatus: followsCompletedOta ? 'reconnecting' : prev.postUpdateStatus,
         }));
-        addLog('TetraRadio disconnected');
+
+        if (followsCompletedOta) {
+          addLog('Radio disconnected for reboot — waiting to reconnect and verify...');
+          otaStatusRef.current = 'idle'; // consume the signal so a later, unrelated disconnect doesn't retrigger this
+        } else {
+          addLog('TetraRadio disconnected');
+        }
       });
       subscriptionsRef.current.disconnectSub = disconnectSub;
 
       addLog('Subscribed to sensor data');
 
       readFirmwareVersion(device).then(version => {
-        if (version) {
-          addLog(`Firmware version: ${version}`);
-          setState(prev => ({ ...prev, firmwareVersion: version }));
+        if (!version) return;
+        addLog(`Firmware version: ${version}`);
+        setState(prev => ({ ...prev, firmwareVersion: version }));
+
+        // If we were waiting to verify a just-installed version, this read
+        // (from the reconnect that just happened) is the verification.
+        if (pendingVerifyVersionRef.current) {
+          clearTimeout(postOtaFailTimeoutRef.current);
+          const expected = pendingVerifyVersionRef.current;
+          pendingVerifyVersionRef.current = null;
+          if (version === expected) {
+            addLog(`Update verified — now running v${version}`);
+            setState(prev => ({ ...prev, postUpdateStatus: 'verified' }));
+          } else {
+            addLog(`Update verification MISMATCH — expected v${expected}, radio reports v${version}`);
+            setState(prev => ({ ...prev, postUpdateStatus: 'mismatch' }));
+          }
+        } else {
+          // Manual test-button path, or version read outside any update
+          // flow — nothing to assert, just clear a stale 'reconnecting' if
+          // one was somehow left over.
+          setState(prev => (prev.postUpdateStatus === 'reconnecting' ? { ...prev, postUpdateStatus: 'idle' } : prev));
         }
       });
 
@@ -461,6 +507,27 @@ function useBLE() {
     }
   }, [requestPermissions, subscribeToDevice, addLog]);
 
+  // Post-OTA reconnect: the radio needs a few seconds to actually reboot and
+  // start advertising again before a scan would find it. 
+  useEffect(() => {
+    if (state.postUpdateStatus !== 'reconnecting') return;
+
+    const reconnectDelay = setTimeout(() => {
+      addLog('Attempting to reconnect after OTA reboot...');
+      startScan();
+    }, 3000);
+
+    postOtaFailTimeoutRef.current = setTimeout(() => {
+      setState(prev => (prev.postUpdateStatus === 'reconnecting' ? { ...prev, postUpdateStatus: 'failed' } : prev));
+      addLog('Radio did not come back online after OTA — check it manually');
+    }, 25000);
+
+    return () => {
+      clearTimeout(reconnectDelay);
+      clearTimeout(postOtaFailTimeoutRef.current);
+    };
+  }, [state.postUpdateStatus]);
+
   const disconnect = useCallback(async () => {
     clearTimeout(scanTimerRef.current);
     managerRef.current?.stopDeviceScan();
@@ -577,10 +644,6 @@ function useBLE() {
   }, [sendCommand]);
 
   // ─── BLE OTA firmware transfer ────────────────────────────────────────────
-  // firmwareBytes must be a Buffer (or Buffer-compatible Uint8Array) of the
-  // full .bin image. Manifest fetch / download / caching happens upstream
-  // of this function — this only handles the wire protocol against
-  // OTAService.ino once you already have the bytes in hand.
   const sendFirmwareUpdate = useCallback(async (firmwareBytes) => {
     if (!deviceRef.current || !state.radioConnected) {
       addLog('OTA: not connected to radio');
@@ -592,9 +655,10 @@ function useBLE() {
     const expectedCRC = crc32(firmwareBytes, 0);
 
     otaAbortRef.current = false;
+    otaStatusRef.current = 'sending';
     setState(prev => ({
       ...prev, otaStatus: 'sending', otaProgress: 0, otaError: null,
-      otaBytesTotal: totalSize, otaBytesSent: 0,
+      otaBytesTotal: totalSize, otaBytesSent: 0, postUpdateStatus: 'idle',
     }));
     addLog(`OTA: starting update, ${totalSize} bytes, crc=0x${expectedCRC.toString(16)}`);
 
@@ -708,6 +772,7 @@ function useBLE() {
 
       // ---- END: verify + apply ----
       if (asyncError) throw asyncError;
+      otaStatusRef.current = 'verifying';
       setState(prev => ({ ...prev, otaStatus: 'verifying' }));
       addLog('OTA: all chunks sent, verifying...');
 
@@ -717,6 +782,7 @@ function useBLE() {
       );
       await donePromise; // rejects on ERR_CRC / ERR_WRITE
 
+      otaStatusRef.current = 'done';
       setState(prev => ({ ...prev, otaStatus: 'done', otaProgress: 1 }));
       addLog('OTA: update applied, radio is rebooting');
       cleanupOTA();
@@ -724,6 +790,7 @@ function useBLE() {
 
     } catch (e) {
       cleanupOTA();
+      otaStatusRef.current = 'error';
       setState(prev => ({ ...prev, otaStatus: 'error', otaError: e.message }));
       addLog(`OTA failed: ${e.message}`);
       // Best-effort ABORT so the radio doesn't sit stuck mid-transfer waiting
@@ -740,6 +807,79 @@ function useBLE() {
   const cancelFirmwareUpdate = useCallback(() => {
     otaAbortRef.current = true;
   }, []);
+
+  // ─── GitHub Releases manifest check ───────────────────────────────────────
+  const checkForUpdate = useCallback(async () => {
+    setState(prev => ({
+      ...prev,
+      updateCheck: { status: 'checking', latestVersion: null, downloadUrl: null, size: 0, error: null },
+    }));
+    try {
+      const res = await fetch(GITHUB_RELEASES_API, {
+        headers: { Accept: 'application/vnd.github+json' },
+      });
+      if (!res.ok) {
+        throw new Error(`GitHub API returned ${res.status}`);
+      }
+      const json = await res.json();
+      const latestVersion = String(json.tag_name || '').replace(/^v/, '');
+      const asset = (json.assets || []).find(a => a.name === 'firmware.bin');
+      if (!latestVersion || !asset) {
+        throw new Error('Latest release is missing a version tag or a firmware.bin asset');
+      }
+      setState(prev => ({
+        ...prev,
+        updateCheck: {
+          status: 'checked',
+          latestVersion,
+          downloadUrl: asset.browser_download_url,
+          size: asset.size,
+          error: null,
+        },
+      }));
+      addLog(`Latest release: v${latestVersion} (${asset.size} bytes)`);
+      return { latestVersion, downloadUrl: asset.browser_download_url, size: asset.size };
+    } catch (e) {
+      setState(prev => ({
+        ...prev,
+        updateCheck: { status: 'error', latestVersion: null, downloadUrl: null, size: 0, error: e.message },
+      }));
+      addLog(`Update check failed: ${e.message}`);
+      return null;
+    }
+  }, [addLog]);
+
+  // Downloads whatever checkForUpdate last found, verifies the byte count
+  // against what GitHub reported, then hands the
+  // buffer to the same transfer path the manual test button uses.
+  const downloadAndInstallUpdate = useCallback(async () => {
+    const { downloadUrl, size, latestVersion } = state.updateCheck;
+    if (!downloadUrl) {
+      addLog('No update available to download — run a check first');
+      return;
+    }
+    try {
+      addLog(`Downloading firmware v${latestVersion}...`);
+      const localPath = FileSystem.cacheDirectory + 'firmware_update.bin';
+      const result = await FileSystem.downloadAsync(downloadUrl, localPath);
+      if (result.status !== 200) {
+        throw new Error(`Download failed with HTTP status ${result.status}`);
+      }
+      const info = await FileSystem.getInfoAsync(localPath);
+      if (size && info.size !== size) {
+        throw new Error(`Downloaded ${info.size} bytes, expected ${size} — likely a truncated download`);
+      }
+      const base64 = await FileSystem.readAsStringAsync(localPath, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      const firmwareBuffer = Buffer.from(base64, 'base64');
+      addLog(`Downloaded firmware v${latestVersion} (${firmwareBuffer.length} bytes), starting transfer...`);
+      pendingVerifyVersionRef.current = latestVersion;
+      sendFirmwareUpdate(firmwareBuffer);
+    } catch (e) {
+      addLog(`Download failed: ${e.message}`);
+    }
+  }, [state.updateCheck, addLog, sendFirmwareUpdate]);
 
   // Poll every second while radio is connected. If sensor data has been
   // silent for >3s, flag sensorDropped. Clears automatically when data resumes.
@@ -759,6 +899,7 @@ function useBLE() {
   return {
     state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert,
     sendFirmwareUpdate, cancelFirmwareUpdate, addLog, readFirmwareVersion,
+    checkForUpdate, downloadAndInstallUpdate,
   };
 }
 
@@ -1031,13 +1172,13 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert,
-          sendFirmwareUpdate, cancelFirmwareUpdate, addLog } = useBLE();
+          sendFirmwareUpdate, cancelFirmwareUpdate, addLog, checkForUpdate, downloadAndInstallUpdate } = useBLE();
   const { radioDetected, radioConnected, scanning, connecting, sensorDropped,
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
           battLevels, log, serialLog, rawLog,
           otaStatus, otaProgress, otaBytesSent, otaBytesTotal, otaError,
-          firmwareVersion } = state;
+          firmwareVersion, updateCheck, postUpdateStatus } = state;
 
   const [showLog, setShowLog] = useState(false);
   const [logStream, setLogStream] = useState('events'); // 'events' | 'serial'
@@ -1143,45 +1284,113 @@ export default function App() {
               <Text style={styles.calibrateBtnText}>⟳  RECALIBRATE</Text>
             </TouchableOpacity>
 
-            {/* TEMPORARY: exercises the full OTA path against a REAL firmware
-                image manually pushed to TEST_FIRMWARE_PATH via adb, so a
-                write+reboot cycle can be validated before the manifest/
-                download flow exists. Remove once real update UI replaces it. */}
+            {/* Real update path: GitHub Releases manifest check + download */}
             <TouchableOpacity
               style={[styles.calibrateBtn, { marginTop: 8 }]}
-              onPress={async () => {
-                try {
-                  const info = await FileSystem.getInfoAsync(TEST_FIRMWARE_PATH);
-                  if (!info.exists) {
-                    addLog(`OTA: no firmware.bin found at ${TEST_FIRMWARE_PATH} — push it via adb first`);
-                    return;
-                  }
-                  const base64 = await FileSystem.readAsStringAsync(TEST_FIRMWARE_PATH, {
-                    encoding: FileSystem.EncodingType.Base64,
-                  });
-                  const firmwareBuffer = Buffer.from(base64, 'base64');
-                  addLog(`OTA: read firmware.bin (${firmwareBuffer.length} bytes) from device storage`);
-                  sendFirmwareUpdate(firmwareBuffer);
-                } catch (e) {
-                  addLog(`OTA: failed to read firmware.bin: ${e.message}`);
-                }
-              }}
-              disabled={otaStatus === 'sending' || otaStatus === 'verifying'}
+              onPress={checkForUpdate}
+              disabled={updateCheck.status === 'checking' || otaStatus === 'sending' || otaStatus === 'verifying'}
             >
               <Text style={styles.calibrateBtnText}>
-                {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
-                  : otaStatus === 'verifying' ? '⇪ VERIFYING...'
-                  : '⇪ TEST OTA TRANSFER (firmware.bin)'}
+                {updateCheck.status === 'checking' ? '⟳ CHECKING FOR UPDATES...' : '⟳ CHECK FOR UPDATES'}
               </Text>
             </TouchableOpacity>
+
+            {updateCheck.status === 'checked' && updateCheck.latestVersion && (
+              compareSemver(updateCheck.latestVersion, firmwareVersion || '0.0.0') > 0 ? (
+                <>
+                  <Text style={{ color: colors.accent, fontSize: 12, marginTop: 6, textAlign: 'center' }}>
+                    Update available: v{updateCheck.latestVersion} (current: v{firmwareVersion ?? 'unknown'})
+                  </Text>
+                  <TouchableOpacity
+                    style={[styles.calibrateBtn, { marginTop: 8 }]}
+                    onPress={downloadAndInstallUpdate}
+                    disabled={otaStatus === 'sending' || otaStatus === 'verifying'}
+                  >
+                    <Text style={styles.calibrateBtnText}>
+                      {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
+                        : otaStatus === 'verifying' ? '⇪ VERIFYING...'
+                        : `⇪ INSTALL v${updateCheck.latestVersion}`}
+                    </Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <Text style={{ color: colors.headerSub, fontSize: 12, marginTop: 6, textAlign: 'center' }}>
+                  Up to date (v{firmwareVersion ?? updateCheck.latestVersion})
+                </Text>
+              )
+            )}
+            {updateCheck.status === 'error' && (
+              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                Update check failed: {updateCheck.error}
+              </Text>
+            )}
+
+            {/* Only shown while otaStatus is still 'done' and hasn't yet
+                transitioned to a postUpdateStatus below — brief, expected. */}
+            {otaStatus === 'done' && postUpdateStatus === 'idle' && (
+              <Text style={{ color: colors.accent, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                Transfer completed — radio should be rebooting now
+              </Text>
+            )}
+            {postUpdateStatus === 'reconnecting' && (
+              <Text style={{ color: colors.headerSub, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                ⟳ Reconnecting to verify update...
+              </Text>
+            )}
+            {postUpdateStatus === 'verified' && (
+              <Text style={{ color: colors.accent, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                ✓ Update verified — now running v{firmwareVersion}
+              </Text>
+            )}
+            {postUpdateStatus === 'mismatch' && (
+              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                ⚠ Version mismatch after update — now running v{firmwareVersion}, expected different. Check the radio.
+              </Text>
+            )}
+            {postUpdateStatus === 'failed' && (
+              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
+                ⚠ Radio didn't come back online after update — check it manually and reconnect.
+              </Text>
+            )}
+
+            {/* DEV-ONLY: exercises the full OTA path against a REAL firmware
+                image manually pushed to TEST_FIRMWARE_PATH via adb — useful for
+                testing an arbitrary local .bin without cutting a GitHub release.
+                Gated behind __DEV__ so it never ships in a production build;
+                delete this block entirely once the real flow above is fully
+                trusted and this bench tool is no longer needed. */}
+            {__DEV__ && (
+              <TouchableOpacity
+                style={[styles.calibrateBtn, { marginTop: 16 }]}
+                onPress={async () => {
+                  try {
+                    const info = await FileSystem.getInfoAsync(TEST_FIRMWARE_PATH);
+                    if (!info.exists) {
+                      addLog(`OTA: no firmware.bin found at ${TEST_FIRMWARE_PATH} — push it via adb first`);
+                      return;
+                    }
+                    const base64 = await FileSystem.readAsStringAsync(TEST_FIRMWARE_PATH, {
+                      encoding: FileSystem.EncodingType.Base64,
+                    });
+                    const firmwareBuffer = Buffer.from(base64, 'base64');
+                    addLog(`OTA: read firmware.bin (${firmwareBuffer.length} bytes) from device storage`);
+                    sendFirmwareUpdate(firmwareBuffer);
+                  } catch (e) {
+                    addLog(`OTA: failed to read firmware.bin: ${e.message}`);
+                  }
+                }}
+                disabled={otaStatus === 'sending' || otaStatus === 'verifying'}
+              >
+                <Text style={styles.calibrateBtnText}>
+                  {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
+                    : otaStatus === 'verifying' ? '⇪ VERIFYING...'
+                    : '⇪ [DEV] TEST OTA TRANSFER (manual firmware.bin)'}
+                </Text>
+              </TouchableOpacity>
+            )}
             {otaStatus === 'error' && (
               <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
                 OTA error: {otaError}
-              </Text>
-            )}
-            {otaStatus === 'done' && (
-              <Text style={{ color: colors.accent, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                Transfer completed — radio should be rebooting now
               </Text>
             )}
           </>

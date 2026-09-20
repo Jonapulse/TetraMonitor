@@ -46,9 +46,9 @@ const OTA_DATA_UUID     = 'ee191e3a-95c6-4bf1-92b8-1980c9e7b8e9';
 const OTA_STATUS_UUID   = '5c8b02e7-5520-468f-bcba-fcc5093da1c9';
 const OTA_VERSION_UUID  = 'c82f2a3c-f48c-4cfa-b447-0277467898e4';
 
-const OTA_CHUNK_PAYLOAD_MAX = 244;
-const OTA_TARGET_MTU        = 249;
-const OTA_CHUNK_DELAY_MS    = 5;
+const OTA_CHUNK_PAYLOAD_MAX = 122;
+const OTA_TARGET_MTU        = 127;
+const OTA_CHUNK_DELAY_MS    = 15;
 
 // Status codes sent by the radio over OTA_STATUS_UUID — must match the
 // OTAStatusCode enum in OTAService.ino.
@@ -451,6 +451,8 @@ function useBLE() {
         resetConnectingGuard();
       }, 15000);
 
+      let handled = false;
+
       managerRef.current.startDeviceScan(
         [SERVICE_UUID],   // matches PhonePeripheral.ino PHONE_SERVICE_UUID
         null,
@@ -463,19 +465,32 @@ function useBLE() {
             return;
           }
 
-          // Anything delivered here already matched the UUID filter above —
-          // no need to check device.name.
+          if (handled) return;
+          handled = true;
+
           managerRef.current.stopDeviceScan();
           clearTimeout(scanTimerRef.current);
           setState(prev => ({ ...prev, radioDetected: true, scanning: false, connecting: true }));
           addLog(`Found ${device.name || DEVICE_NAME}! Connecting...`);
 
           try {
-            await new Promise(resolve => setTimeout(resolve, 300)); //TODO: Check if you we need this debug thing
-            const connected = await device.connect();
-            await connected.discoverAllServicesAndCharacteristics();
+            let connected = null;
+            const MAX_ATTEMPTS = 4;
+            for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+              try {
+                connected = await device.connect({ timeout: 10000, refreshGatt: 'OnConnected' });
+                await connected.discoverAllServicesAndCharacteristics();
+                break;
+              } catch (e) {
+                addLog(`Connect attempt ${attempt}/${MAX_ATTEMPTS} failed: ${e.message} (android=${e.androidErrorCode})`);
+                try { await device.cancelConnection(); } catch (_) {}
+                if (attempt === MAX_ATTEMPTS) throw e;
+                await new Promise(resolve => setTimeout(resolve, 1000));
+              }
+            }
+
             deviceRef.current = connected;
-            setState(prev => ({ ...prev, radioConnected: true, connecting: false}));
+            setState(prev => ({ ...prev, radioConnected: true, connecting: false }));
             addLog(`Connected to ${DEVICE_NAME}`);
             subscribeToDevice(connected);
             resetConnectingGuard();
@@ -502,7 +517,6 @@ function useBLE() {
     }
     catch(e){
       addLog(`Scan setup failed: ${e.message}`);
-    } finally {
       resetConnectingGuard();
     }
   }, [requestPermissions, subscribeToDevice, addLog]);

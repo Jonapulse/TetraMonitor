@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useContext, useMemo } 
 import {
   View,
   Text,
+  Image,
   TouchableOpacity,
   StyleSheet,
   ScrollView,
@@ -121,6 +122,9 @@ function compareSemver(a, b) {
   }
   return 0;
 }
+
+const LOGO_LIGHT = require('./assets/logo_light_mode.png');
+const LOGO_DARK = require('./assets/logo_dark_mode.png');
 
 const ThemeContext = React.createContext(null);
 
@@ -1222,7 +1226,12 @@ export default function App() {
       <View style={styles.header}>
         <View style={styles.headerRow}>
           <View>
-            <Text style={styles.headerTitle}>TETRASKI</Text>
+            <Image
+              source={theme === 'dark' ? LOGO_DARK : LOGO_LIGHT}
+              style={styles.headerLogo}
+              resizeMode="contain"
+              accessibilityLabel="TetraSki"
+              />
             <Text style={styles.headerSub}>Radio Controller Interface</Text>
           </View>
           <TouchableOpacity
@@ -1522,6 +1531,7 @@ const createStyles = (C) => StyleSheet.create({
   header:          { paddingTop: 56, paddingBottom: 16, paddingHorizontal: 20, backgroundColor: C.bg },
   headerRow:       { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   headerTitle:     { fontSize: 26, fontWeight: '900', color: C.textBright, letterSpacing: 4 },
+  headerLogo:      { height: 36, apsectRatio: 3.97},
   headerAccent:    { color: C.accent },
   headerSub:       { fontSize: 11, color: C.textDim, letterSpacing: 2, marginTop: 2 },
   themeToggle:     { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center',
@@ -1571,7 +1581,7 @@ const createStyles = (C) => StyleSheet.create({
   sensorMeta:      { flexDirection: 'row', gap: 8, alignItems: 'center' },
   sensorActive:    { fontSize: 9, color: C.dim, fontWeight: '700', letterSpacing: 1.5 },
   sensorActiveOn:  { color: C.accent },
-  battText:        { fontSize: 10, color: C.textDim },
+  battText:        { fontSize: 14, color: C.textDim },
   barTrack:        { height: 6, backgroundColor: C.trackBg, borderRadius: 3, position: 'relative', overflow: 'visible' },
   barFill:         { height: 6, borderRadius: 3 },
   barThreshold:    { position: 'absolute', top: -3, width: 2, height: 12, backgroundColor: C.warn, borderRadius: 1 },

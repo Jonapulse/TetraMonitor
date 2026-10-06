@@ -46,9 +46,12 @@ const OTA_DATA_UUID     = 'ee191e3a-95c6-4bf1-92b8-1980c9e7b8e9';
 const OTA_STATUS_UUID   = '5c8b02e7-5520-468f-bcba-fcc5093da1c9';
 const OTA_VERSION_UUID  = 'c82f2a3c-f48c-4cfa-b447-0277467898e4';
 
-const OTA_CHUNK_PAYLOAD_MAX = 122;
-const OTA_TARGET_MTU        = 127;
-const OTA_CHUNK_DELAY_MS    = 15;
+const OTA_CHUNK_PAYLOAD_MAX = 244;
+const OTA_TARGET_MTU        = 249;
+const OTA_CHUNK_DELAY_MS    = 5;
+// READY is only sent once the radio's main loop is free (mid sensor connect or
+// calibration it can be a while). Firmware calibration times out at 40 s.
+const OTA_READY_TIMEOUT_MS  = 45000;
 
 // Status codes sent by the radio over OTA_STATUS_UUID — must match the
 // OTAStatusCode enum in OTAService.ino.
@@ -758,7 +761,16 @@ function useBLE() {
       await device.writeCharacteristicWithResponseForService(
         OTA_SERVICE_UUID, OTA_CONTROL_UUID, startPayload.toString('base64')
       );
-      await readyPromise; // rejects if the radio replies with an error code instead of READY
+      let readyTimer;
+      await Promise.race([
+        readyPromise, // rejects if the radio replies with an error code instead of READY
+        new Promise((_, reject) => {
+          readyTimer = setTimeout(
+            () => reject(new Error('Radio busy, no READY received')),
+            OTA_READY_TIMEOUT_MS
+          );
+        }),
+      ]).finally(() => clearTimeout(readyTimer));
       addLog('OTA: radio ready, sending firmware...');
 
       // ---- DATA: seq(2 LE) + chunk payload, fixed-delay paced ----

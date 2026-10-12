@@ -12,6 +12,15 @@
         "NSBluetoothAlwaysUsageDescription": "TetraSki uses Bluetooth to connect to your radio controller and sensors.",
         "NSBluetoothPeripheralUsageDescription": "TetraSki uses Bluetooth to connect to your radio controller and sensors."
       }
-    }
+    },
+    "plugins": [
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false
+        }
+      ],
+      "expo-asset"
+    ]
   }
 }

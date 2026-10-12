@@ -2,14 +2,18 @@ import React, { useState, useEffect, useRef, useCallback, useContext, useMemo } 
 import {
   View,
   Text,
+  Image,
   TouchableOpacity,
   StyleSheet,
   ScrollView,
+  Modal,
   Animated,
   StatusBar,
   Platform,
   PermissionsAndroid,
   PanResponder,
+  Vibration,
+  Alert,
 } from 'react-native';
 
 import { Buffer } from 'buffer';
@@ -122,6 +126,146 @@ function compareSemver(a, b) {
   return 0;
 }
 
+const LOGO_LIGHT = require('./assets/logo_light_mode.png');
+const LOGO_DARK = require('./assets/logo_dark_mode.png');
+
+// ─── Alarms ───────────────────────────────────────────────────────────────────
+// Battery percentages that trigger a low-battery alarm. Edit this list freely —
+// each level fires once as a battery drops to or below it.
+const LOW_BATTERY_ALARM_LEVELS = [20, 10];
+// A battery has to climb this far back above a level before that level can
+// fire again, so a reading hovering around a threshold doesn't re-alarm.
+const BATTERY_ALARM_REARM_MARGIN = 5;
+const ALARM_VIBRATION_PATTERN = [0, 400, 150, 400, 150, 400]; // ms: wait, buzz, pause, ...
+const ALARM_SOUND = require('./assets/alarm.wav');
+const ALARM_NOTIFICATION_CHANNEL = 'alarms';
+
+// expo-audio is a native module, so it only exists in app builds made after it
+// was added. On older builds the require throws and alarms are vibration-only.
+let alarmPlayer = null;
+try {
+  const { createAudioPlayer, setAudioModeAsync } = require('expo-audio');
+  setAudioModeAsync({ playsInSilentMode: true }).catch(() => {});
+  alarmPlayer = createAudioPlayer(ALARM_SOUND);
+} catch (e) {
+  alarmPlayer = null;
+}
+
+// Same story for expo-notifications: without the native module there's no
+// system notification, only the in-app popup.
+let Notifications = null;
+try {
+  Notifications = require('expo-notifications');
+  // While the app is open the popup already explains the alarm, so skip the
+  // heads-up banner and just file the message in the notification list.
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowBanner: false,
+      shouldShowList: true,
+      shouldPlaySound: false,
+      shouldSetBadge: false,
+    }),
+  });
+  if (Platform.OS === 'android') {
+    Notifications.setNotificationChannelAsync(ALARM_NOTIFICATION_CHANNEL, {
+      name: 'Alarms',
+      importance: Notifications.AndroidImportance.HIGH,
+    }).catch(() => {});
+  }
+} catch (e) {
+  Notifications = null;
+}
+
+// Vibrate + sound, an in-app popup explaining the issue, and the same message
+// posted to the phone's notifications.
+function triggerAlarm({ title, message }) {
+  Vibration.vibrate(ALARM_VIBRATION_PATTERN);
+  try {
+    alarmPlayer?.seekTo(0);
+    alarmPlayer?.play();
+  } catch (e) {
+    // Non-fatal — vibration has already fired
+  }
+  Alert.alert(title, message);
+  Notifications?.scheduleNotificationAsync({
+    content: { title, body: message },
+    trigger: Platform.OS === 'android' ? { channelId: ALARM_NOTIFICATION_CHANNEL } : null,
+  }).catch(() => {});
+}
+
+// What each alarm tells the user. `batteries` is e.g. ['Left 18%', 'Right 9%'].
+const ALARM_MESSAGES = {
+  sensorDropped: () => ({
+    title: 'Sensor disconnected',
+    message: 'The radio has stopped receiving sensor data. Check to see if a sensor was turned off.',
+  }),
+  sensorBattery: (batteries) => ({
+    title: 'Sensor battery low',
+    message: `Low sensor battery: ${batteries.join(', ')}. Recharge or swap the sensor soon.`,
+  }),
+  skiBattery: (level) => ({
+    title: 'Ski battery low',
+    message: `The ski battery is at ${level}%. Recharge it soon.`,
+  }),
+};
+
+// Fires an alarm when sensor data drops out and when any battery falls to one
+// of LOW_BATTERY_ALARM_LEVELS.
+function useAlarms({ radioConnected, sensorDropped, sensorMode, battLevels, skiBattery, addLog }) {
+  const prevDroppedRef = useRef(false);
+  const alarmedLevelRef = useRef({}); // battery name → lowest level already alarmed
+
+  useEffect(() => {
+    if (sensorDropped && !prevDroppedRef.current) {
+      triggerAlarm(ALARM_MESSAGES.sensorDropped());
+      addLog('ALARM: sensor disconnected');
+    }
+    prevDroppedRef.current = sensorDropped;
+  }, [sensorDropped]);
+
+  // Ask once for permission to post notifications (Android 13+ / iOS).
+  useEffect(() => {
+    Notifications?.requestPermissionsAsync().catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!radioConnected) {
+      alarmedLevelRef.current = {};
+      return;
+    }
+    const batteries = [
+      ['Left', battLevels[0]],
+      ['Right', battLevels[1]],
+      ...(sensorMode === 4 ? [['Wedge In', battLevels[2]], ['Wedge Out', battLevels[3]]] : []),
+      ['Ski', skiBattery],
+    ];
+    const firedSensors = [];
+    let firedSki = null;
+    for (const [name, level] of batteries) {
+      if (level == null || level <= 0) continue; // 0 / null = no reading yet
+      const alarmed = alarmedLevelRef.current[name];
+      const reached = LOW_BATTERY_ALARM_LEVELS.filter(t => level <= t);
+      const lowest = reached.length ? Math.min(...reached) : null;
+      if (lowest !== null && (alarmed === undefined || lowest < alarmed)) {
+        alarmedLevelRef.current[name] = lowest;
+        if (name === 'Ski') firedSki = level;
+        else firedSensors.push(`${name} ${level}%`);
+      } else if (alarmed !== undefined && level > alarmed + BATTERY_ALARM_REARM_MARGIN) {
+        const held = LOW_BATTERY_ALARM_LEVELS.filter(t => level <= t + BATTERY_ALARM_REARM_MARGIN);
+        alarmedLevelRef.current[name] = held.length ? Math.min(...held) : undefined;
+      }
+    }
+    if (firedSensors.length) {
+      triggerAlarm(ALARM_MESSAGES.sensorBattery(firedSensors));
+      addLog(`ALARM: low sensor battery — ${firedSensors.join(', ')}`);
+    }
+    if (firedSki !== null) {
+      triggerAlarm(ALARM_MESSAGES.skiBattery(firedSki));
+      addLog(`ALARM: low ski battery — ${firedSki}%`);
+    }
+  }, [radioConnected, sensorMode, battLevels, skiBattery]);
+}
+
 const ThemeContext = React.createContext(null);
 
 //Initialize BleManager at module level to avoid messy on-dismount destroys
@@ -143,6 +287,7 @@ function useBLE() {
     direction0: 0, val0: 0, val1: 0,
     direction1: 0, val2: 0, val3: 0,
     battLevels: [0, 0, 0, 0],
+    skiBattery: null,        // PLACEHOLDER: ski battery %, null until the radio reports it
     log: ['Ready. Press SCAN to find TetraRadio.'],
     serialLog: ['Waiting for serial output from radio controller...'],
     rawLog: [],
@@ -324,6 +469,8 @@ function useBLE() {
           if (battChar?.value) {
             const bytes = Buffer.from(battChar.value, 'base64');
             setState(prev => ({ ...prev, battLevels: [bytes[0], bytes[1], bytes[2] ?? 0, bytes[3] ?? 0] }));
+            // TODO: set skiBattery here once the radio includes the ski's
+            // battery level in a data packet (firmware doesn't send it yet).
           }
         } catch (e) {
           // Non-fatal — battery read failure doesn't affect sensor data
@@ -354,6 +501,7 @@ function useBLE() {
           direction0: 0, val0: 0, val1: 0,
           direction1: 0, val2: 0, val3: 0,
           battLevels: [0, 0, 0, 0],
+          skiBattery: null,
           firmwareVersion: null,
           postUpdateStatus: followsCompletedOta ? 'reconnecting' : prev.postUpdateStatus,
         }));
@@ -583,6 +731,7 @@ function useBLE() {
         direction0: 0, val0: 0, val1: 0,
         direction1: 0, val2: 0, val3: 0,
         battLevels: [0, 0, 0, 0],
+        skiBattery: null,
       }));
     }, wrote ? 3000 : 0);
   }, [addLog, cleanupSubscriptions]);
@@ -1161,7 +1310,7 @@ function LogStreamDropdown({ selected, open, onToggleOpen, onSelect }) {
 
 
 // ─── Connection Status Badge ──────────────────────────────────────────────────
-function StatusBadge({ detected, connected, scanning, sensorDropped }) {
+function StatusBadge({ detected, connected, scanning, sensorDropped, skiBattery }) {
   const { colors, styles } = useContext(ThemeContext);
   const pulseAnim = useRef(new Animated.Value(1)).current;
 
@@ -1186,10 +1335,16 @@ function StatusBadge({ detected, connected, scanning, sensorDropped }) {
   return (
     <View style={styles.statusCard}>
       <Animated.View style={[styles.statusDot, { backgroundColor: color, opacity: (scanning || sensorDropped) ? pulseAnim : 1 }]} />
-      <View>
+      <View style={{ flex: 1 }}>
         <Text style={[styles.statusLabel, { color }]}>{label}</Text>
         <Text style={styles.statusSub}>{sublabel}</Text>
       </View>
+      {connected && (
+        <View style={styles.skiBatt}>
+          <Text style={styles.skiBattLabel}>SKI</Text>
+          <Text style={styles.battText}>🔋 {skiBattery == null ? '--' : skiBattery}%</Text>
+        </View>
+      )}
     </View>
   );
 }
@@ -1202,7 +1357,7 @@ export default function App() {
   const { radioDetected, radioConnected, scanning, connecting, sensorDropped,
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
-          battLevels, log, serialLog, rawLog,
+          battLevels, skiBattery, log, serialLog, rawLog,
           otaStatus, otaProgress, otaBytesSent, otaBytesTotal, otaError,
           firmwareVersion, updateCheck, postUpdateStatus } = state;
 
@@ -1210,8 +1365,22 @@ export default function App() {
   const [logStream, setLogStream] = useState('events'); // 'events' | 'serial'
   const [logDropdownOpen, setLogDropdownOpen] = useState(false);
   const [theme, setTheme] = useState('dark');
+  const [showSettings, setShowSettings] = useState(false);
   const colors = theme === 'dark' ? darkColors : lightColors;
   const styles = useMemo(() => createStyles(colors), [colors]);
+
+  useAlarms({ radioConnected, sensorDropped, sensorMode, battLevels, skiBattery, addLog });
+
+  // Check GitHub for a newer firmware release once on app open, so the
+  // settings button can flag it as soon as a radio connects and reports
+  // its own version.
+  useEffect(() => {
+    checkForUpdate();
+  }, []);
+
+  const otaBusy = otaStatus === 'sending' || otaStatus === 'verifying';
+  const updateAvailable = updateCheck.status === 'checked' && !!updateCheck.latestVersion && !!firmwareVersion
+    && compareSemver(updateCheck.latestVersion, firmwareVersion) > 0;
 
   return (
     <ThemeContext.Provider value={{ colors, styles }}>
@@ -1222,38 +1391,55 @@ export default function App() {
       <View style={styles.header}>
         <View style={styles.headerRow}>
           <View>
-            <Text style={styles.headerTitle}>TETRASKI</Text>
+            <Image
+              source={theme === 'dark' ? LOGO_DARK : LOGO_LIGHT}
+              style={styles.headerLogo}
+              resizeMode="contain"
+              accessibilityLabel="TetraSki"
+              />
             <Text style={styles.headerSub}>Radio Controller Interface</Text>
           </View>
-          <TouchableOpacity
-            style={styles.themeToggle}
-            onPress={() => setTheme(t => (t === 'dark' ? 'light' : 'dark'))}
-          >
-            <Text style={styles.themeToggleText}>{theme === 'dark' ? '☀️' : '🌙'}</Text>
-          </TouchableOpacity>
+          <View style={styles.headerBtns}>
+            <TouchableOpacity
+              style={styles.themeToggle}
+              onPress={() => setTheme(t => (t === 'dark' ? 'light' : 'dark'))}
+            >
+              <Text style={styles.themeToggleText}>{theme === 'dark' ? '☀️' : '🌙'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.themeToggle}
+              onPress={() => setShowSettings(true)}
+              accessibilityLabel={updateAvailable ? 'Settings, firmware update available' : 'Settings'}
+            >
+              <Text style={styles.themeToggleText}>⚙️</Text>
+              {updateAvailable && <View style={styles.updateDot} />}
+            </TouchableOpacity>
+          </View>
         </View>
       </View>
 
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
 
         {/* Connection Status */}
-        <StatusBadge detected={radioDetected} connected={radioConnected} scanning={scanning} sensorDropped={sensorDropped} />
+        <StatusBadge detected={radioDetected} connected={radioConnected} scanning={scanning} sensorDropped={sensorDropped} skiBattery={skiBattery} />
         {radioConnected && firmwareVersion && (
           <Text style={{ color: colors.textSecondary ?? colors.headerSub, fontSize: 12, textAlign: 'center', marginTop: -8, marginBottom: 8 }}>
             Firmware v{firmwareVersion}
           </Text>
         )}
 
-        {/* Scan / Disconnect Button */}
-        <TouchableOpacity
-          style={[styles.mainBtn, radioConnected && styles.mainBtnDisconnect]}
-          onPress={radioConnected ? disconnect : startScan}
-          disabled={scanning || connecting}
-        >
-          <Text style={styles.mainBtnText}>
-            {scanning ? 'SCANNING...' : connecting ? 'CONNECTING...' : radioConnected ? 'DISCONNECT' : 'SCAN FOR RADIO'}
-          </Text>
-        </TouchableOpacity>
+        {/* Scan Button — disconnect lives in the settings screen */}
+        {!radioConnected && (
+          <TouchableOpacity
+            style={styles.mainBtn}
+            onPress={startScan}
+            disabled={scanning || connecting}
+          >
+            <Text style={styles.mainBtnText}>
+              {scanning ? 'SCANNING...' : connecting ? 'CONNECTING...' : 'SCAN FOR RADIO'}
+            </Text>
+          </TouchableOpacity>
+        )}
 
         {/* Direction Indicator */}
           {radioConnected && (
@@ -1288,137 +1474,6 @@ export default function App() {
               />
             )}
 
-            {/* Controls */}
-            <Text style={styles.sectionTitle}>CONTROLS</Text>
-
-            <Text style={styles.controlLabel}>SENSOR MODE</Text>
-            <View style={styles.btnRow}>
-              {[2, 4].map((mode) => (
-                <TouchableOpacity
-                  key={mode}
-                  style={[styles.segBtn, sensorMode === mode && styles.segBtnActive]}
-                  onPress={() => handleSensorMode(mode)}
-                >
-                  <Text style={[styles.segBtnText, sensorMode === mode && styles.segBtnTextActive]}>
-                    {mode} SENSORS
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            <TouchableOpacity style={styles.calibrateBtn} onPress={() => sendCommand('5')}>
-              <Text style={styles.calibrateBtnText}>⟳  RECALIBRATE</Text>
-            </TouchableOpacity>
-
-            {/* Real update path: GitHub Releases manifest check + download */}
-            <TouchableOpacity
-              style={[styles.calibrateBtn, { marginTop: 8 }]}
-              onPress={checkForUpdate}
-              disabled={updateCheck.status === 'checking' || otaStatus === 'sending' || otaStatus === 'verifying'}
-            >
-              <Text style={styles.calibrateBtnText}>
-                {updateCheck.status === 'checking' ? '⟳ CHECKING FOR UPDATES...' : '⟳ CHECK FOR UPDATES'}
-              </Text>
-            </TouchableOpacity>
-
-            {updateCheck.status === 'checked' && updateCheck.latestVersion && (
-              compareSemver(updateCheck.latestVersion, firmwareVersion || '0.0.0') > 0 ? (
-                <>
-                  <Text style={{ color: colors.accent, fontSize: 12, marginTop: 6, textAlign: 'center' }}>
-                    Update available: v{updateCheck.latestVersion} (current: v{firmwareVersion ?? 'unknown'})
-                  </Text>
-                  <TouchableOpacity
-                    style={[styles.calibrateBtn, { marginTop: 8 }]}
-                    onPress={downloadAndInstallUpdate}
-                    disabled={otaStatus === 'sending' || otaStatus === 'verifying'}
-                  >
-                    <Text style={styles.calibrateBtnText}>
-                      {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
-                        : otaStatus === 'verifying' ? '⇪ VERIFYING...'
-                        : `⇪ INSTALL v${updateCheck.latestVersion}`}
-                    </Text>
-                  </TouchableOpacity>
-                </>
-              ) : (
-                <Text style={{ color: colors.headerSub, fontSize: 12, marginTop: 6, textAlign: 'center' }}>
-                  Up to date (v{firmwareVersion ?? updateCheck.latestVersion})
-                </Text>
-              )
-            )}
-            {updateCheck.status === 'error' && (
-              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                Update check failed: {updateCheck.error}
-              </Text>
-            )}
-
-            {/* Only shown while otaStatus is still 'done' and hasn't yet
-                transitioned to a postUpdateStatus below — brief, expected. */}
-            {otaStatus === 'done' && postUpdateStatus === 'idle' && (
-              <Text style={{ color: colors.accent, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                Transfer completed — radio should be rebooting now
-              </Text>
-            )}
-            {postUpdateStatus === 'reconnecting' && (
-              <Text style={{ color: colors.headerSub, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                ⟳ Reconnecting to verify update...
-              </Text>
-            )}
-            {postUpdateStatus === 'verified' && (
-              <Text style={{ color: colors.accent, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                ✓ Update verified — now running v{firmwareVersion}
-              </Text>
-            )}
-            {postUpdateStatus === 'mismatch' && (
-              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                ⚠ Version mismatch after update — now running v{firmwareVersion}, expected different. Check the radio.
-              </Text>
-            )}
-            {postUpdateStatus === 'failed' && (
-              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                ⚠ Radio didn't come back online after update — check it manually and reconnect.
-              </Text>
-            )}
-
-            {/* DEV-ONLY: exercises the full OTA path against a REAL firmware
-                image manually pushed to TEST_FIRMWARE_PATH via adb — useful for
-                testing an arbitrary local .bin without cutting a GitHub release.
-                Gated behind __DEV__ so it never ships in a production build;
-                delete this block entirely once the real flow above is fully
-                trusted and this bench tool is no longer needed. */}
-            {__DEV__ && (
-              <TouchableOpacity
-                style={[styles.calibrateBtn, { marginTop: 16 }]}
-                onPress={async () => {
-                  try {
-                    const info = await FileSystem.getInfoAsync(TEST_FIRMWARE_PATH);
-                    if (!info.exists) {
-                      addLog(`OTA: no firmware.bin found at ${TEST_FIRMWARE_PATH} — push it via adb first`);
-                      return;
-                    }
-                    const base64 = await FileSystem.readAsStringAsync(TEST_FIRMWARE_PATH, {
-                      encoding: FileSystem.EncodingType.Base64,
-                    });
-                    const firmwareBuffer = Buffer.from(base64, 'base64');
-                    addLog(`OTA: read firmware.bin (${firmwareBuffer.length} bytes) from device storage`);
-                    sendFirmwareUpdate(firmwareBuffer);
-                  } catch (e) {
-                    addLog(`OTA: failed to read firmware.bin: ${e.message}`);
-                  }
-                }}
-                disabled={otaStatus === 'sending' || otaStatus === 'verifying'}
-              >
-                <Text style={styles.calibrateBtnText}>
-                  {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
-                    : otaStatus === 'verifying' ? '⇪ VERIFYING...'
-                    : '⇪ [DEV] TEST OTA TRANSFER (manual firmware.bin)'}
-                </Text>
-              </TouchableOpacity>
-            )}
-            {otaStatus === 'error' && (
-              <Text style={{ color: colors.danger, fontSize: 11, marginTop: 6, textAlign: 'center' }}>
-                OTA error: {otaError}
-              </Text>
-            )}
           </>
         )}
 
@@ -1457,6 +1512,210 @@ export default function App() {
 
         <View style={{ height: 40 }} />
       </ScrollView>
+
+      {/* Settings — sensitive controls kept off the main screen */}
+      <Modal
+        visible={showSettings}
+        animationType="slide"
+        statusBarTranslucent
+        onRequestClose={() => setShowSettings(false)}
+      >
+        <View style={styles.root}>
+          <View style={styles.header}>
+            <View style={styles.headerRow}>
+              <Text style={styles.settingsTitle}>SETTINGS</Text>
+              <TouchableOpacity
+                style={styles.themeToggle}
+                onPress={() => setShowSettings(false)}
+                accessibilityLabel="Close settings"
+              >
+                <Text style={[styles.themeToggleText, { color: colors.text }]}>✕</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
+
+            {!radioConnected && (
+              <Text style={styles.settingsNote}>
+                No radio connected — connect to change sensor mode, recalibrate, or install firmware.
+              </Text>
+            )}
+
+            {radioConnected && (
+              <>
+                <Text style={styles.sectionTitle}>CONNECTION</Text>
+                <TouchableOpacity
+                  style={[styles.mainBtn, styles.mainBtnDisconnect]}
+                  onPress={() => {
+                    setShowSettings(false);
+                    disconnect();
+                  }}
+                >
+                  <Text style={[styles.mainBtnText, { color: theme === 'dark' ? colors.textBright : colors.danger }]}>
+                    DISCONNECT
+                  </Text>
+                </TouchableOpacity>
+
+                <Text style={styles.sectionTitle}>SENSOR MODE</Text>
+                <View style={styles.btnRow}>
+                  {[2, 4].map((mode) => (
+                    <TouchableOpacity
+                      key={mode}
+                      style={[styles.segBtn, sensorMode === mode && styles.segBtnActive]}
+                      onPress={() => handleSensorMode(mode)}
+                    >
+                      <Text style={[styles.segBtnText, sensorMode === mode && styles.segBtnTextActive]}>
+                        {mode} SENSORS
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                <Text style={styles.sectionTitle}>CALIBRATION</Text>
+                <TouchableOpacity style={styles.calibrateBtn} onPress={() => sendCommand('5')}>
+                  <Text style={styles.calibrateBtnText}>⟳  RESET CALIBRATION</Text>
+                </TouchableOpacity>
+              </>
+            )}
+
+            {/* Firmware — stays visible while disconnected so post-update
+                reboot/verify status isn't hidden when the radio drops. */}
+            <View style={styles.settingsTitleRow}>
+              <Text style={[styles.sectionTitle, { marginBottom: 0, marginTop: 0 }]}>FIRMWARE</Text>
+              {updateAvailable && <Text style={styles.updateTag}>UPDATE AVAILABLE</Text>}
+            </View>
+            <Text style={styles.settingsNote}>
+              {firmwareVersion ? `Installed: v${firmwareVersion}` : 'Installed: unknown (no radio connected)'}
+            </Text>
+
+            {/* Real update path: GitHub Releases manifest check + download */}
+            <TouchableOpacity
+              style={[styles.calibrateBtn, { marginBottom: 8 }]}
+              onPress={checkForUpdate}
+              disabled={updateCheck.status === 'checking' || otaBusy}
+            >
+              <Text style={styles.calibrateBtnText}>
+                {updateCheck.status === 'checking' ? '⟳ CHECKING FOR UPDATES...' : '⟳ CHECK FOR UPDATES'}
+              </Text>
+            </TouchableOpacity>
+
+            {updateCheck.status === 'checked' && updateCheck.latestVersion && (
+              updateAvailable ? (
+                <>
+                  <Text style={[styles.settingsStatus, { color: colors.accent }]}>
+                    Update available: v{updateCheck.latestVersion} (current: v{firmwareVersion})
+                  </Text>
+                  <TouchableOpacity
+                    style={[styles.calibrateBtn, { marginTop: 8, marginBottom: 8, borderColor: colors.accent }]}
+                    onPress={downloadAndInstallUpdate}
+                    disabled={otaBusy}
+                  >
+                    <Text style={[styles.calibrateBtnText, { color: colors.accent }]}>
+                      {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
+                        : otaStatus === 'verifying' ? '⇪ VERIFYING...'
+                        : `⇪ INSTALL v${updateCheck.latestVersion}`}
+                    </Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <Text style={styles.settingsStatus}>
+                  {firmwareVersion
+                    ? `Up to date (v${firmwareVersion})`
+                    : `Latest release: v${updateCheck.latestVersion} — connect a radio to compare`}
+                </Text>
+              )
+            )}
+            {updateCheck.status === 'error' && (
+              <Text style={[styles.settingsStatus, { color: colors.danger }]}>
+                Update check failed: {updateCheck.error}
+              </Text>
+            )}
+
+            {/* Only shown while otaStatus is still 'done' and hasn't yet
+                transitioned to a postUpdateStatus below — brief, expected. */}
+            {otaStatus === 'done' && postUpdateStatus === 'idle' && (
+              <Text style={[styles.settingsStatus, { color: colors.accent }]}>
+                Transfer completed — radio should be rebooting now
+              </Text>
+            )}
+            {postUpdateStatus === 'reconnecting' && (
+              <Text style={styles.settingsStatus}>
+                ⟳ Reconnecting to verify update...
+              </Text>
+            )}
+            {postUpdateStatus === 'verified' && (
+              <Text style={[styles.settingsStatus, { color: colors.accent }]}>
+                ✓ Update verified — now running v{firmwareVersion}
+              </Text>
+            )}
+            {postUpdateStatus === 'mismatch' && (
+              <Text style={[styles.settingsStatus, { color: colors.danger }]}>
+                ⚠ Version mismatch after update — now running v{firmwareVersion}, expected different. Check the radio.
+              </Text>
+            )}
+            {postUpdateStatus === 'failed' && (
+              <Text style={[styles.settingsStatus, { color: colors.danger }]}>
+                ⚠ Radio didn't come back online after update — check it manually and reconnect.
+              </Text>
+            )}
+
+            {/* DEV-ONLY: exercises the full OTA path against a REAL firmware
+                image manually pushed to TEST_FIRMWARE_PATH via adb — useful for
+                testing an arbitrary local .bin without cutting a GitHub release.
+                Gated behind __DEV__ so it never ships in a production build;
+                delete this block entirely once the real flow above is fully
+                trusted and this bench tool is no longer needed. */}
+            {__DEV__ && radioConnected && (
+              <TouchableOpacity
+                style={[styles.calibrateBtn, { marginTop: 16, marginBottom: 8 }]}
+                onPress={async () => {
+                  try {
+                    const info = await FileSystem.getInfoAsync(TEST_FIRMWARE_PATH);
+                    if (!info.exists) {
+                      addLog(`OTA: no firmware.bin found at ${TEST_FIRMWARE_PATH} — push it via adb first`);
+                      return;
+                    }
+                    const base64 = await FileSystem.readAsStringAsync(TEST_FIRMWARE_PATH, {
+                      encoding: FileSystem.EncodingType.Base64,
+                    });
+                    const firmwareBuffer = Buffer.from(base64, 'base64');
+                    addLog(`OTA: read firmware.bin (${firmwareBuffer.length} bytes) from device storage`);
+                    sendFirmwareUpdate(firmwareBuffer);
+                  } catch (e) {
+                    addLog(`OTA: failed to read firmware.bin: ${e.message}`);
+                  }
+                }}
+                disabled={otaBusy}
+              >
+                <Text style={styles.calibrateBtnText}>
+                  {otaStatus === 'sending'    ? `⇪ SENDING... ${Math.round(otaProgress * 100)}% (${otaBytesSent}/${otaBytesTotal})`
+                    : otaStatus === 'verifying' ? '⇪ VERIFYING...'
+                    : '⇪ [DEV] TEST OTA TRANSFER (manual firmware.bin)'}
+                </Text>
+              </TouchableOpacity>
+            )}
+            {otaStatus === 'error' && (
+              <Text style={[styles.settingsStatus, { color: colors.danger }]}>
+                OTA error: {otaError}
+              </Text>
+            )}
+
+            {radioConnected && (
+              <>
+                <Text style={[styles.sectionTitle, { marginTop: 24 }]}>RADIO</Text>
+                {/* TODO: soft reset isn't implemented yet (no firmware command) */}
+                <TouchableOpacity style={[styles.calibrateBtn, { opacity: 0.4, marginBottom: 8 }]} disabled>
+                  <Text style={styles.calibrateBtnText}>↺  SOFT RESET FIRMWARE</Text>
+                </TouchableOpacity>
+                <Text style={styles.settingsStatus}>Not available yet</Text>
+              </>
+            )}
+
+            <View style={{ height: 40 }} />
+          </ScrollView>
+        </View>
+      </Modal>
     </View>
     </ThemeContext.Provider>
   );
@@ -1522,17 +1781,29 @@ const createStyles = (C) => StyleSheet.create({
   header:          { paddingTop: 56, paddingBottom: 16, paddingHorizontal: 20, backgroundColor: C.bg },
   headerRow:       { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   headerTitle:     { fontSize: 26, fontWeight: '900', color: C.textBright, letterSpacing: 4 },
+  headerLogo:      { height: 36, aspectRatio: 755 / 190, alignSelf: 'flex-start' },
   headerAccent:    { color: C.accent },
   headerSub:       { fontSize: 11, color: C.textDim, letterSpacing: 2, marginTop: 2 },
   themeToggle:     { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center',
                      backgroundColor: C.surface, borderWidth: 1, borderColor: C.border },
   themeToggleText: { fontSize: 18 },
+  headerBtns:      { flexDirection: 'row', gap: 8 },
+  updateDot:       { position: 'absolute', top: -2, right: -2, width: 12, height: 12, borderRadius: 6,
+                     backgroundColor: C.warn, borderWidth: 2, borderColor: C.bg },
+
+  settingsTitle:   { fontSize: 18, fontWeight: '900', color: C.text, letterSpacing: 4 },
+  settingsTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 8, marginBottom: 10 },
+  settingsNote:    { color: C.textDim, fontSize: 12, marginBottom: 12 },
+  settingsStatus:  { color: C.textDim, fontSize: 12, marginBottom: 8, textAlign: 'center' },
+  updateTag:       { color: C.warn, fontSize: 10, fontWeight: '800', letterSpacing: 2 },
 
   statusCard:      { flexDirection: 'row', alignItems: 'center', backgroundColor: C.surface,
                      borderRadius: 10, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: C.border, gap: 14 },
   statusDot:       { width: 12, height: 12, borderRadius: 6 },
   statusLabel:     { fontSize: 13, fontWeight: '700', letterSpacing: 1.5 },
   statusSub:       { fontSize: 11, color: C.textDim, marginTop: 2 },
+  skiBatt:         { alignItems: 'flex-end' },
+  skiBattLabel:    { fontSize: 9, color: C.textDim, letterSpacing: 2, fontWeight: '700', marginBottom: 2 },
 
   mainBtn:         { backgroundColor: C.accent, borderRadius: 8, paddingVertical: 14,
                      alignItems: 'center', marginBottom: 20 },
@@ -1571,7 +1842,7 @@ const createStyles = (C) => StyleSheet.create({
   sensorMeta:      { flexDirection: 'row', gap: 8, alignItems: 'center' },
   sensorActive:    { fontSize: 9, color: C.dim, fontWeight: '700', letterSpacing: 1.5 },
   sensorActiveOn:  { color: C.accent },
-  battText:        { fontSize: 10, color: C.textDim },
+  battText:        { fontSize: 14, color: C.textDim },
   barTrack:        { height: 6, backgroundColor: C.trackBg, borderRadius: 3, position: 'relative', overflow: 'visible' },
   barFill:         { height: 6, borderRadius: 3 },
   barThreshold:    { position: 'absolute', top: -3, width: 2, height: 12, backgroundColor: C.warn, borderRadius: 1 },

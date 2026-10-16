@@ -35,12 +35,12 @@ const DEVICE_NAME       = 'TetraRadio';
 const TEST_FIRMWARE_PATH = FileSystem.documentDirectory + 'firmware.bin';
 
 // ─── GitHub Releases manifest source ──────────────────────────────────────
-// Public repo — no auth needed. Convention: release tag is "vX.Y.Z" matching
-// FIRMWARE_VERSION (v-prefix stripped before compare); release has exactly
-// one asset named "firmware.bin".
-const GITHUB_OWNER = 'Jonapulse'; 
-const GITHUB_REPO  = 'TetraskiController';          
-const GITHUB_RELEASES_API = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest`;
+// Public repo, no auth needed. The latest release carries three assets:
+// firmware.bin (radio), ski_fw.bin (ski controller) and manifest.json, e.g.
+// {"radio":"1.0.9","ski":"0.2.0"}. Versions are compared against the manifest,
+// not the release tag. Point GITHUB_REPO at a scratch repo to test.
+const GITHUB_REPO = 'Jonapulse/TetraskiController';
+const GITHUB_RELEASES_API = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 
 // ─── BLE OTA UUIDs (must match OTAService.ino) ───────────────────────────────
 // in OTAService.ino, and keep both sides in sync.
@@ -49,10 +49,17 @@ const OTA_CONTROL_UUID  = 'ed3c98b9-0a71-45e0-9b14-b89d3316549d';
 const OTA_DATA_UUID     = 'ee191e3a-95c6-4bf1-92b8-1980c9e7b8e9';
 const OTA_STATUS_UUID   = '5c8b02e7-5520-468f-bcba-fcc5093da1c9';
 const OTA_VERSION_UUID  = 'c82f2a3c-f48c-4cfa-b447-0277467898e4';
+const OTA_SKI_VERSION_UUID = 'f937d204-2a79-423d-bddf-e8530aafe87b';
 
 const OTA_CHUNK_PAYLOAD_MAX = 244;
 const OTA_TARGET_MTU        = 249;
 const OTA_CHUNK_DELAY_MS    = 5;
+// The ski image is written to the radio's LittleFS, which is slower than the
+// OTA partition, so its chunks are paced further apart.
+const OTA_SKI_CHUNK_DELAY_MS = 20;
+// Longest wait for the radio to report the relay result. A healthy relay takes
+// well under a minute, the radio's own worst-case timeouts add up to more.
+const SKI_RELAY_TIMEOUT_MS  = 180000;
 // READY is only sent once the radio's main loop is free (mid sensor connect or
 // calibration it can be a while). Firmware calibration times out at 40 s.
 const OTA_READY_TIMEOUT_MS  = 45000;
@@ -63,6 +70,10 @@ const OTA_STATUS = {
   READY:     0x01,
   PROGRESS:  0x02,
   DONE:      0x03,
+  SKI_STORED:         0x04, // ski image written to the radio and CRC verified
+  SKI_RELAY_PROGRESS: 0x10, // + phase(1) + bytesSent(4 LE) + bytesTotal(4 LE)
+  SKI_RELAY_OK:       0x11, // + new ski version (ASCII)
+  SKI_RELAY_FAIL:     0x12, // + reason(1) + skiNak(1) + known(1) + old ski version (ASCII)
   ERR_SIZE:  0xE0,
   ERR_SEQ:   0xE1,
   ERR_CRC:   0xE2,
@@ -78,6 +89,29 @@ const OTA_ERROR_MESSAGES = {
   [OTA_STATUS.ERR_WRITE]: 'Flash write failed on radio',
   [OTA_STATUS.ERR_STATE]: 'Radio rejected command for current OTA state',
   [OTA_STATUS.ERR_BEGIN]: 'Radio failed to begin update (Update.begin() failed)',
+};
+
+// Must match SkiRelayPhase and SkiUpdateResult in SkiUpdateService.ino.
+const SKI_RELAY_PHASES = {
+  1: 'Checking image',
+  2: 'Entering update mode',
+  3: 'Sending to ski',
+  4: 'Ski verifying image',
+  5: 'Ski installing',
+  6: 'Waiting for ski to restart',
+};
+
+const SKI_RELAY_FAIL_MESSAGES = {
+  1: 'Ski already runs this version or newer',
+  2: 'Radio does not know the ski version',
+  3: 'No ski image version stored on radio',
+  4: 'Ski did not enter update mode',
+  5: 'Transfer to ski failed',
+  6: 'Ski refused to install the image',
+  7: 'Ski did not answer after installing',
+  8: 'Ski reports a different version than the image',
+  9: 'No ski image stored on radio',
+  10: 'Version string not found in the image',
 };
 
 // ─── CRC32 (standard CRC-32/IEEE 802.3 — matches ESP-IDF's crc32_le) ─────────
@@ -124,6 +158,28 @@ function compareSemver(a, b) {
     if (na !== nb) return na > nb ? 1 : -1;
   }
   return 0;
+}
+
+// The ski comparison uses MAJOR.MINOR.PATCH only, so "0.2.0-bench" is "0.2.0".
+function semverCore(v) {
+  const m = String(v).match(/\d+\.\d+\.\d+/);
+  return m ? m[0] : '0.0.0';
+}
+
+// The one place a ski update is confirmed before anything is downloaded or
+// sent. Resolves true to go ahead.
+function confirmSkiUpdate({ from, to }) {
+  return new Promise(resolve => {
+    Alert.alert(
+      'Update ski controller?',
+      `Install v${to} (currently v${from}).`,
+      [
+        { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+        { text: 'Install', onPress: () => resolve(true) },
+      ],
+      { cancelable: true, onDismiss: () => resolve(false) }
+    );
+  });
 }
 
 const LOGO_LIGHT = require('./assets/logo_light_mode.png');
@@ -299,8 +355,12 @@ function useBLE() {
     firmwareVersion: null,   // read from the radio on connect; used for manifest
                              // compare and to verify a post-OTA reboot landed
                              // on the expected version
-    updateCheck: { status: 'idle', latestVersion: null, downloadUrl: null, size: 0, error: null },
+    skiVersion: null,        // cached ski version read from the radio, null if unknown
+    updateCheck: { status: 'idle', latestVersion: null, downloadUrl: null, size: 0, ski: null, error: null },
                              // status: 'idle' | 'checking' | 'checked' | 'error'
+                             // ski: { version, downloadUrl, size } or null
+    skiUpdate: { status: 'idle', phase: 0, sent: 0, total: 0, newVersion: null, error: null, known: true, oldVersion: null },
+                             // status: 'idle' | 'downloading' | 'sending' | 'relaying' | 'done' | 'error'
     postUpdateStatus: 'idle',
                              // 'idle' | 'reconnecting' | 'verified' | 'mismatch' | 'failed'
                              // — tracks reconnecting after an OTA reboot and
@@ -410,6 +470,18 @@ function useBLE() {
     }
   }, [addLog]);
 
+  // Empty value means the radio has no answer from the ski yet. A radio too
+  // old to have this characteristic throws, which also reads as unknown.
+  const readSkiVersion = useCallback(async (device) => {
+    try {
+      const char = await device.readCharacteristicForService(OTA_SERVICE_UUID, OTA_SKI_VERSION_UUID);
+      const version = char?.value ? Buffer.from(char.value, 'base64').toString('utf8') : '';
+      setState(prev => ({ ...prev, skiVersion: version || null }));
+    } catch (e) {
+      setState(prev => ({ ...prev, skiVersion: null }));
+    }
+  }, []);
+
   const subscribeToDevice = useCallback(async (device) => {
     // Defensive: if subscribeToDevice were ever called again while a previous
     // connection's listeners are still live, this prevents them from stacking.
@@ -503,6 +575,7 @@ function useBLE() {
           battLevels: [0, 0, 0, 0],
           skiBattery: null,
           firmwareVersion: null,
+          skiVersion: null,
           postUpdateStatus: followsCompletedOta ? 'reconnecting' : prev.postUpdateStatus,
         }));
 
@@ -517,6 +590,7 @@ function useBLE() {
 
       addLog('Subscribed to sensor data');
 
+      readSkiVersion(device);
       readFirmwareVersion(device).then(version => {
         if (!version) return;
         addLog(`Firmware version: ${version}`);
@@ -565,7 +639,7 @@ function useBLE() {
     } catch (e) {
       addLog(`Subscribe error: ${e.message}`);
     }
-  }, [addLog, cleanupSubscriptions, addSerialLog, addRawLog, readFirmwareVersion]);
+  }, [addLog, cleanupSubscriptions, addSerialLog, addRawLog, readFirmwareVersion, readSkiVersion]);
 
   const startScan = useCallback(async () => {
     if (isConnectingRef.current) {
@@ -810,7 +884,9 @@ function useBLE() {
   }, [sendCommand]);
 
   // ─── BLE OTA firmware transfer ────────────────────────────────────────────
-  const sendFirmwareUpdate = useCallback(async (firmwareBytes) => {
+  // skiVersion set: the image is the ski controller's. It is stored on the
+  // radio instead of being flashed, and the radio does not reboot.
+  const sendFirmwareUpdate = useCallback(async (firmwareBytes, skiVersion = null) => {
     if (!deviceRef.current || !state.radioConnected) {
       addLog('OTA: not connected to radio');
       return { success: false, error: 'Not connected' };
@@ -866,7 +942,7 @@ function useBLE() {
           return;
         }
 
-        if (code === OTA_STATUS.READY || code === OTA_STATUS.DONE) {
+        if (code === OTA_STATUS.READY || code === OTA_STATUS.DONE || code === OTA_STATUS.SKI_STORED) {
           pendingResolve?.(code);
         } else {
           const msg = OTA_ERROR_MESSAGES[code] || `Unknown OTA status (0x${code.toString(16)})`;
@@ -901,10 +977,13 @@ function useBLE() {
       addLog(`OTA: MTU=${negotiatedMtu}, using ${chunkPayload}-byte chunks`);
 
       // ---- START: 'S' + size(4 LE) + crc32(4 LE) ----
-      const startPayload = Buffer.alloc(9);
-      startPayload.write('S', 0, 'ascii');
+      // Ski image: 'K' + size(4 LE) + crc32(4 LE) + version (ASCII). A separate
+      // letter so a radio too old to know it rejects it instead of flashing itself.
+      const startPayload = Buffer.alloc(9 + (skiVersion ? skiVersion.length : 0));
+      startPayload.write(skiVersion ? 'K' : 'S', 0, 'ascii');
       startPayload.writeUInt32LE(totalSize, 1);
       startPayload.writeUInt32LE(expectedCRC, 5);
+      if (skiVersion) startPayload.write(skiVersion, 9, 'ascii');
 
       const readyPromise = waitForStatus();
       await device.writeCharacteristicWithResponseForService(
@@ -939,7 +1018,7 @@ function useBLE() {
         await device.writeCharacteristicWithoutResponseForService(
           OTA_SERVICE_UUID, OTA_DATA_UUID, framed.toString('base64')
         );
-        await new Promise(r => setTimeout(r, OTA_CHUNK_DELAY_MS));
+        await new Promise(r => setTimeout(r, skiVersion ? OTA_SKI_CHUNK_DELAY_MS : OTA_CHUNK_DELAY_MS));
 
         seq++;
         offset = end;
@@ -956,6 +1035,14 @@ function useBLE() {
         OTA_SERVICE_UUID, OTA_CONTROL_UUID, Buffer.from(['E'.charCodeAt(0)]).toString('base64')
       );
       await donePromise; // rejects on ERR_CRC / ERR_WRITE
+
+      if (skiVersion) {
+        otaStatusRef.current = 'idle';
+        setState(prev => ({ ...prev, otaStatus: 'idle', otaProgress: 1 }));
+        addLog('OTA: ski image stored on radio');
+        cleanupOTA();
+        return { success: true };
+      }
 
       otaStatusRef.current = 'done';
       setState(prev => ({ ...prev, otaStatus: 'done', otaProgress: 1 }));
@@ -987,8 +1074,9 @@ function useBLE() {
   const checkForUpdate = useCallback(async () => {
     setState(prev => ({
       ...prev,
-      updateCheck: { status: 'checking', latestVersion: null, downloadUrl: null, size: 0, error: null },
+      updateCheck: { status: 'checking', latestVersion: null, downloadUrl: null, size: 0, ski: null, error: null },
     }));
+    if (deviceRef.current) readSkiVersion(deviceRef.current);
     try {
       const res = await fetch(GITHUB_RELEASES_API, {
         headers: { Accept: 'application/vnd.github+json' },
@@ -997,11 +1085,28 @@ function useBLE() {
         throw new Error(`GitHub API returned ${res.status}`);
       }
       const json = await res.json();
-      const latestVersion = String(json.tag_name || '').replace(/^v/, '');
-      const asset = (json.assets || []).find(a => a.name === 'firmware.bin');
-      if (!latestVersion || !asset) {
-        throw new Error('Latest release is missing a version tag or a firmware.bin asset');
+      const assets = json.assets || [];
+      const asset = assets.find(a => a.name === 'firmware.bin');
+      const skiAsset = assets.find(a => a.name === 'ski_fw.bin');
+      const manifestAsset = assets.find(a => a.name === 'manifest.json');
+
+      // A release made before manifests existed only has the tag to go by.
+      let manifest = { radio: String(json.tag_name || '').replace(/^v/, '') };
+      if (manifestAsset) {
+        const manifestRes = await fetch(manifestAsset.browser_download_url);
+        if (!manifestRes.ok) {
+          throw new Error(`manifest.json download returned ${manifestRes.status}`);
+        }
+        manifest = await manifestRes.json();
       }
+
+      const latestVersion = manifest.radio ? String(manifest.radio) : '';
+      if (!latestVersion || !asset) {
+        throw new Error('Latest release is missing a radio version or a firmware.bin asset');
+      }
+      const ski = manifest.ski && skiAsset
+        ? { version: String(manifest.ski), downloadUrl: skiAsset.browser_download_url, size: skiAsset.size }
+        : null;
       setState(prev => ({
         ...prev,
         updateCheck: {
@@ -1009,20 +1114,21 @@ function useBLE() {
           latestVersion,
           downloadUrl: asset.browser_download_url,
           size: asset.size,
+          ski,
           error: null,
         },
       }));
-      addLog(`Latest release: v${latestVersion} (${asset.size} bytes)`);
-      return { latestVersion, downloadUrl: asset.browser_download_url, size: asset.size };
+      addLog(`Latest release: radio v${latestVersion}` + (ski ? `, ski v${ski.version}` : ', no ski image'));
+      return { latestVersion, downloadUrl: asset.browser_download_url, size: asset.size, ski };
     } catch (e) {
       setState(prev => ({
         ...prev,
-        updateCheck: { status: 'error', latestVersion: null, downloadUrl: null, size: 0, error: e.message },
+        updateCheck: { status: 'error', latestVersion: null, downloadUrl: null, size: 0, ski: null, error: e.message },
       }));
       addLog(`Update check failed: ${e.message}`);
       return null;
     }
-  }, [addLog]);
+  }, [addLog, readSkiVersion]);
 
   // Downloads whatever checkForUpdate last found, verifies the byte count
   // against what GitHub reported, then hands the  buffer to the same 
@@ -1056,6 +1162,116 @@ function useBLE() {
     }
   }, [state.updateCheck, addLog, sendFirmwareUpdate]);
 
+  // Tells the radio to relay its stored ski image to the ski, and resolves
+  // with the radio's final report: { ok: true, newVersion } or
+  // { ok: false, reason, skiNak, known, oldVersion }.
+  const relaySkiImage = useCallback((device) => new Promise((resolve, reject) => {
+    let timer = null;
+    let sub = null;
+    sub = device.monitorCharacteristicForService(
+      OTA_SERVICE_UUID,
+      OTA_STATUS_UUID,
+      (error, characteristic) => {
+        if (error) {
+          finish(() => reject(new Error(`Lost contact with radio: ${error.message}`)));
+          return;
+        }
+        if (!characteristic?.value) return;
+        const bytes = Buffer.from(characteristic.value, 'base64');
+        const code = bytes[0];
+
+        if (code === OTA_STATUS.SKI_RELAY_PROGRESS && bytes.length >= 10) {
+          const phase = bytes[1];
+          const sent = bytes.readUInt32LE(2);
+          const total = bytes.readUInt32LE(6);
+          setState(prev => ({ ...prev, skiUpdate: { ...prev.skiUpdate, phase, sent, total } }));
+        } else if (code === OTA_STATUS.SKI_RELAY_OK) {
+          finish(() => resolve({ ok: true, newVersion: bytes.slice(1).toString('utf8') }));
+        } else if (code === OTA_STATUS.SKI_RELAY_FAIL && bytes.length >= 4) {
+          finish(() => resolve({
+            ok: false,
+            reason: bytes[1],
+            skiNak: bytes[2],
+            known: bytes[3] === 1,
+            oldVersion: bytes.slice(4).toString('utf8'),
+          }));
+        } else if (code === OTA_STATUS.ERR_STATE) {
+          finish(() => reject(new Error('Radio is busy and did not start the relay')));
+        }
+      }
+    );
+    function finish(settle) {
+      clearTimeout(timer);
+      sub?.remove();
+      settle();
+    }
+    timer = setTimeout(
+      () => finish(() => reject(new Error('No result from radio'))),
+      SKI_RELAY_TIMEOUT_MS
+    );
+    device.writeCharacteristicWithResponseForService(
+      OTA_SERVICE_UUID, OTA_CONTROL_UUID, Buffer.from(['R'.charCodeAt(0)]).toString('base64')
+    ).catch(e => finish(() => reject(e)));
+  }), []);
+
+  // Ski update, start to finish: confirm, download ski_fw.bin, store it on the
+  // radio over the normal chunk path, then have the radio relay it to the ski.
+  const downloadAndInstallSkiUpdate = useCallback(async () => {
+    const ski = state.updateCheck.ski;
+    const from = state.skiVersion;
+    if (!ski || !from || !deviceRef.current) return;
+
+    if (!(await confirmSkiUpdate({ from, to: ski.version }))) return;
+
+    const setSki = (fields) => setState(prev => ({ ...prev, skiUpdate: { ...prev.skiUpdate, ...fields } }));
+    setSki({ status: 'downloading', phase: 0, sent: 0, total: 0, newVersion: null, error: null, known: true, oldVersion: from });
+    try {
+      addLog(`Downloading ski firmware v${ski.version}...`);
+      const localPath = FileSystem.cacheDirectory + 'ski_fw_update.bin';
+      const result = await FileSystem.downloadAsync(ski.downloadUrl, localPath);
+      if (result.status !== 200) {
+        throw new Error(`Download failed with HTTP status ${result.status}`);
+      }
+      const info = await FileSystem.getInfoAsync(localPath);
+      if (ski.size && info.size !== ski.size) {
+        throw new Error(`Downloaded ${info.size} bytes, expected ${ski.size}`);
+      }
+      const base64 = await FileSystem.readAsStringAsync(localPath, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      const image = Buffer.from(base64, 'base64');
+
+      setSki({ status: 'sending' });
+      const sent = await sendFirmwareUpdate(image, ski.version);
+      if (!sent.success) throw new Error(`Could not store the image on the radio (${sent.error})`);
+
+      setSki({ status: 'relaying', phase: 0, sent: 0, total: image.length });
+      addLog('Ski update: radio is relaying the image to the ski...');
+      const report = await relaySkiImage(deviceRef.current);
+
+      if (report.ok) {
+        addLog(`Ski update done, ski now runs v${report.newVersion}`);
+        setState(prev => ({
+          ...prev,
+          skiVersion: report.newVersion,
+          skiUpdate: { ...prev.skiUpdate, status: 'done', newVersion: report.newVersion },
+        }));
+      } else {
+        const message = SKI_RELAY_FAIL_MESSAGES[report.reason] || `Unknown failure (${report.reason})`;
+        addLog(`Ski update failed: ${message} (ski code 0x${report.skiNak.toString(16)}), `
+          + (report.known ? `ski still on v${report.oldVersion}` : `ski state unknown, was v${report.oldVersion}`));
+        setState(prev => ({
+          ...prev,
+          skiVersion: report.known ? (report.oldVersion || null) : null,
+          skiUpdate: { ...prev.skiUpdate, status: 'error', error: message, known: report.known, oldVersion: report.oldVersion || from },
+        }));
+      }
+    } catch (e) {
+      addLog(`Ski update failed: ${e.message}`);
+      setSki({ status: 'error', error: e.message, known: true, oldVersion: from });
+    }
+  }, [state.updateCheck, state.skiVersion, addLog, sendFirmwareUpdate, relaySkiImage]);
+
   // Poll every second while radio is connected. If sensor data has been
   // silent for >3s, flag sensorDropped. Clears automatically when data resumes.
   // Pure observer — never sends commands or interferes with firmware reconnect.
@@ -1074,7 +1290,7 @@ function useBLE() {
   return {
     state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert,
     sendFirmwareUpdate, cancelFirmwareUpdate, addLog, readFirmwareVersion,
-    checkForUpdate, downloadAndInstallUpdate,
+    checkForUpdate, downloadAndInstallUpdate, downloadAndInstallSkiUpdate,
   };
 }
 
@@ -1353,13 +1569,14 @@ function StatusBadge({ detected, connected, scanning, sensorDropped, skiBattery 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const { state, startScan, disconnect, sendCommand, handleSensorMode, handleSensitivity, handleInvert,
-          sendFirmwareUpdate, cancelFirmwareUpdate, addLog, checkForUpdate, downloadAndInstallUpdate } = useBLE();
+          sendFirmwareUpdate, cancelFirmwareUpdate, addLog, checkForUpdate, downloadAndInstallUpdate,
+          downloadAndInstallSkiUpdate } = useBLE();
   const { radioDetected, radioConnected, scanning, connecting, sensorDropped,
           sensorMode, sensitivities, invertPair0, invertPair1,
           direction0, val0, val1, direction1, val2, val3,
           battLevels, skiBattery, log, serialLog, rawLog,
           otaStatus, otaProgress, otaBytesSent, otaBytesTotal, otaError,
-          firmwareVersion, updateCheck, postUpdateStatus } = state;
+          firmwareVersion, skiVersion, updateCheck, skiUpdate, postUpdateStatus } = state;
 
   const [showLog, setShowLog] = useState(false);
   const [logStream, setLogStream] = useState('events'); // 'events' | 'serial'
@@ -1378,9 +1595,12 @@ export default function App() {
     checkForUpdate();
   }, []);
 
-  const otaBusy = otaStatus === 'sending' || otaStatus === 'verifying';
+  const skiBusy = ['downloading', 'sending', 'relaying'].includes(skiUpdate.status);
+  const otaBusy = otaStatus === 'sending' || otaStatus === 'verifying' || skiBusy;
   const updateAvailable = updateCheck.status === 'checked' && !!updateCheck.latestVersion && !!firmwareVersion
     && compareSemver(updateCheck.latestVersion, firmwareVersion) > 0;
+  const skiUpdateAvailable = updateCheck.status === 'checked' && !!updateCheck.ski && !!skiVersion
+    && compareSemver(semverCore(updateCheck.ski.version), semverCore(skiVersion)) > 0;
 
   return (
     <ThemeContext.Provider value={{ colors, styles }}>
@@ -1698,6 +1918,64 @@ export default function App() {
             {otaStatus === 'error' && (
               <Text style={[styles.settingsStatus, { color: colors.danger }]}>
                 OTA error: {otaError}
+              </Text>
+            )}
+
+            {/* Ski controller firmware, relayed through the radio. Listed
+                after the radio's own update, which goes first. */}
+            {radioConnected && (
+              <>
+                <View style={[styles.settingsTitleRow, { marginTop: 24 }]}>
+                  <Text style={[styles.sectionTitle, { marginBottom: 0, marginTop: 0 }]}>SKI CONTROLLER</Text>
+                  {skiUpdateAvailable && <Text style={styles.updateTag}>UPDATE AVAILABLE</Text>}
+                </View>
+                <Text style={styles.settingsNote}>
+                  {skiVersion ? `Ski controller: v${skiVersion}` : "Ski controller: unknown, can't be updated here"}
+                </Text>
+                {skiVersion && skiUpdateAvailable && (
+                  updateAvailable ? (
+                    <Text style={styles.settingsStatus}>
+                      v{updateCheck.ski.version} available. Update the radio first.
+                    </Text>
+                  ) : (
+                    <TouchableOpacity
+                      style={[styles.calibrateBtn, { marginTop: 8, marginBottom: 8, borderColor: colors.accent }]}
+                      onPress={downloadAndInstallSkiUpdate}
+                      disabled={otaBusy}
+                    >
+                      <Text style={[styles.calibrateBtnText, { color: colors.accent }]}>
+                        {skiUpdate.status === 'downloading' ? '⇪ DOWNLOADING...'
+                          : skiUpdate.status === 'sending' ? `⇪ SENDING TO RADIO... ${Math.round(otaProgress * 100)}%`
+                          : skiUpdate.status === 'relaying' ? '⇪ UPDATING SKI...'
+                          : `⇪ INSTALL SKI v${updateCheck.ski.version}`}
+                      </Text>
+                    </TouchableOpacity>
+                  )
+                )}
+                {skiVersion && !skiUpdateAvailable && updateCheck.status === 'checked' && updateCheck.ski
+                  && skiUpdate.status !== 'done' && (
+                  <Text style={styles.settingsStatus}>Up to date (v{skiVersion})</Text>
+                )}
+              </>
+            )}
+            {skiUpdate.status === 'relaying' && (
+              <Text style={styles.settingsStatus}>
+                {SKI_RELAY_PHASES[skiUpdate.phase] || 'Starting relay'}
+                {skiUpdate.phase === 3 && skiUpdate.total > 0
+                  ? ` ${Math.round((skiUpdate.sent / skiUpdate.total) * 100)}% (${skiUpdate.sent}/${skiUpdate.total})`
+                  : '...'}
+              </Text>
+            )}
+            {skiUpdate.status === 'done' && (
+              <Text style={[styles.settingsStatus, { color: colors.accent }]}>
+                ✓ Ski controller updated, now running v{skiUpdate.newVersion}
+              </Text>
+            )}
+            {skiUpdate.status === 'error' && (
+              <Text style={[styles.settingsStatus, { color: colors.danger }]}>
+                ⚠ Ski update failed: {skiUpdate.error}. {skiUpdate.known
+                  ? `Ski controller is still on v${skiUpdate.oldVersion}.`
+                  : `Ski controller state is unknown (was v${skiUpdate.oldVersion}).`}
               </Text>
             )}
 
